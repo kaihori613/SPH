@@ -1,0 +1,881 @@
+#pragma kernel Integrate
+#pragma kernel ComputeForces
+#pragma kernel ComputeDensityPressure
+#pragma kernel ComputeNormals
+#pragma kernel BitonicSort
+#pragma kernel ReorderParticles
+#pragma kernel CalculateCellStartEnd
+#pragma kernel ComputeXSPH
+#pragma kernel ApplyXSPH
+#pragma kernel ComputeVorticity
+#pragma kernel ApplyVorticityConfinement
+#pragma kernel ClearCellRanges
+#pragma kernel InitSortKeys
+#pragma kernel PCIComputeDensity
+#pragma kernel PCINonPressureForces
+#pragma kernel PCIPredictStep
+#pragma kernel PCIPressureUpdate
+#pragma kernel PCIPressureAccel
+#pragma kernel PCIApplyAccel
+#pragma kernel PCIComputePressureForce
+
+struct Particle
+{
+    float pressure;
+    float density;
+    float3 currentForce;
+    float3 velocity;
+    float3 position;
+};
+
+RWStructuredBuffer<Particle> _particles;        // unsorted master buffer
+RWStructuredBuffer<Particle> _sortedParticles;  // sorted buffer (contiguous by cell)
+RWStructuredBuffer<uint> _particleIndices;      // permutation: sorted slot -> master index
+RWStructuredBuffer<uint> _sortKeys;             // length = sortLength (padded)
+RWStructuredBuffer<uint> _cellStarts;           // start index (or 0xffffffff if empty)
+RWStructuredBuffer<uint> _cellEnds;             // end index (exclusive)
+RWStructuredBuffer<float3> _particleNormals;
+RWStructuredBuffer<float3> _xsphDelta;
+RWStructuredBuffer<float3> _vorticity;
+
+// PCISPH predicted state (sorted-slot indexed, transient within one substep)
+RWStructuredBuffer<float3> _predPos;    // predicted position, re-predicted each iteration
+RWStructuredBuffer<float3> _predVel;    // BASE (non-pressure) predicted velocity, constant in loop
+RWStructuredBuffer<float3> _predAccel;  // pressure acceleration from the full accumulated pressure
+
+// Counts / grid
+uint particleCount;   // real particle count
+uint sortLength;      // padded (power of two)
+int3 _gridRes;
+int _gridCellCount;
+
+// Fluid constants
+float particleMass;
+float viscosity;
+float restDensity;
+float boundDamping;
+float timeStep;
+float3 boxSize;
+float stiffness;      // c0 in the Tait EOS
+float particleRadius;
+float _pcisphDelta;   // PCISPH pressure scaling factor (delta)
+
+// Collision sphere
+float3 spherePosition;
+float sphereRadius;
+
+// SPH kernel coefficients
+float h, h2, h3, h9;
+float kSpikyGrad; // = -45/(pi*h6)
+float kViscLap;   // = 45/(pi*h6)
+float poly6C;     // = 315/(64*pi*h9)
+float invH;       // = 1/h
+
+// Surface tension
+float alpha_cohesion;
+float beta_adhesion;
+float gamma_curvature;
+int enableSurfaceTension;
+float cohesionCommon; // = 32/(pi*h9)
+float h6over64;       // = h6/64
+float adhesionC;      // = 0.007 / pow(h, 3.25)
+
+// XSPH
+int enableXSPH;
+float xsphAlpha;
+
+// Vorticity
+int enableVorticity;
+float vorticityEps;
+
+// Air friction / wind (air-fluid drag: dv/dt = -k (v - v_air), Koschier/Gissler)
+int enableAirDrag;
+float airDragCoeff;             // drag rate k (1/s)
+float3 windVelocity;           // ambient air velocity v_air
+int airDragSurfaceOnly;        // 1 = only exposed free-surface particles feel the air
+float airDragSurfaceThreshold; // fraction of restDensity below which a particle is "surface"
+
+// Sort state
+int block;
+int dim;
+
+// ---------------------------------------------------------------------------
+// Grid helpers
+// ---------------------------------------------------------------------------
+int3 GetCell(float3 position)
+{
+    float3 halfs = 0.5 * boxSize;
+    float3 g = (position + halfs) * invH;
+    return int3(clamp((int)floor(g.x), 0, _gridRes.x - 1),
+                clamp((int)floor(g.y), 0, _gridRes.y - 1),
+                clamp((int)floor(g.z), 0, _gridRes.z - 1));
+}
+
+inline uint CellLinear(int3 c)
+{
+    return (uint)(c.x + c.y * _gridRes.x + c.z * _gridRes.x * _gridRes.y);
+}
+
+[numthreads(256,1,1)]
+void ClearCellRanges(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= (uint)_gridCellCount) return;
+    _cellStarts[c] = 0xffffffffu;
+    _cellEnds[c]   = 0xffffffffu;
+}
+
+[numthreads(256,1,1)]
+void InitSortKeys(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= sortLength) return;
+
+    if (i >= particleCount)
+    {
+        _sortKeys[i] = 0xffffffffu; // sentinel: padded slots sort to the end
+        return;
+    }
+
+    uint pIndex = _particleIndices[i];
+    int3 c = GetCell(_particles[pIndex].position);
+    _sortKeys[i] = CellLinear(c);
+}
+
+// Bitonic sort over the padded (power-of-two) range. Swaps keys and the index
+// permutation together so _particleIndices ends up ordered by cell.
+[numthreads(256,1,1)]
+void BitonicSort(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= sortLength) return;
+
+    uint j = i ^ block;
+    if (j <= i || j >= sortLength) return;
+
+    uint key_i = _sortKeys[i];
+    uint key_j = _sortKeys[j];
+
+    bool up = ((i & dim) == 0);
+    if ((up && key_i > key_j) || (!up && key_i < key_j))
+    {
+        _sortKeys[i] = key_j;
+        _sortKeys[j] = key_i;
+
+        uint temp = _particleIndices[i];
+        _particleIndices[i] = _particleIndices[j];
+        _particleIndices[j] = temp;
+    }
+}
+
+[numthreads(256,1,1)]
+void CalculateCellStartEnd(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= sortLength) return;
+
+    uint cell = _sortKeys[i];
+    if (cell == 0xffffffffu) return;
+
+    uint prev = (i == 0) ? 0xffffffffu : _sortKeys[i - 1];
+    uint next = (i == sortLength - 1) ? 0xffffffffu : _sortKeys[i + 1];
+
+    if (cell != prev) _cellStarts[cell] = i;
+    if (cell != next) _cellEnds[cell] = i + 1;
+}
+
+[numthreads(256,1,1)]
+void ReorderParticles(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+    uint originalIndex = _particleIndices[id.x];
+    _sortedParticles[id.x] = _particles[originalIndex];
+}
+
+// ---------------------------------------------------------------------------
+// SPH kernels
+// ---------------------------------------------------------------------------
+inline float hr(float r) { return max(h - r, 0.0); }
+
+float Wpoly6(float r2)
+{
+    float term = max(h2 - r2, 0.0);
+    return poly6C * term * term * term;
+}
+
+float3 gradSpiky(float3 rij, float dist)
+{
+    float3 grad = float3(0, 0, 0);
+    float t = hr(dist);
+    if (t > 0.0)
+    {
+        float invDist = rsqrt(max(dot(rij, rij), 1e-12));
+        grad = (kSpikyGrad * t * t) * (rij * invDist);
+    }
+    return grad;
+}
+
+float ViscosityKernelSecondDerivative(float r)
+{
+    float t = hr(r);
+    return (t == 0.0) ? 0.0 : kViscLap * t;
+}
+
+float CohesionKernel(float r)
+{
+    float t = hr(r);
+    if (t == 0.0) return 0.0;
+    float r3 = r * r * r;
+    if (2.0 * r <= h) return cohesionCommon * (2.0 * t * t * t * r3 - h6over64);
+    return cohesionCommon * (t * t * t * r3);
+}
+
+float AdhesionKernel(float r)
+{
+    if (r <= 0.5 * h || r > h) return 0.0;
+    float term = max(-4.0 * (r * r) * invH + 6.0 * r - 2.0 * h, 0.0);
+    return adhesionC * sqrt(sqrt(max(term, 0.0)));
+}
+
+// ---------------------------------------------------------------------------
+// Simulation
+// ---------------------------------------------------------------------------
+[numthreads(256,1,1)]
+void ComputeDensityPressure(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    float3 pos = _sortedParticles[id.x].position;
+    int3 cell = GetCell(pos);
+    float rho = 0.0;
+
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+
+                for (uint t = start; t < end; ++t)
+                {
+                    float3 diff = pos - _sortedParticles[t].position;
+                    float r2 = dot(diff, diff);
+                    if (r2 < h2) rho += particleMass * Wpoly6(r2);
+                }
+            }
+        }
+    }
+
+    float rhoSafe = max(rho, 1e-6);
+    _sortedParticles[id.x].density = rhoSafe;
+
+    // Tait EOS: p = (c0^2 * rho0 / gamma) * ((rho/rho0)^gamma - 1), clamped >= 0 (no tension)
+    const float gamma = 7.0;
+    float k_tait = (stiffness * stiffness * restDensity) / gamma;
+    float p = k_tait * (pow(rhoSafe / restDensity, gamma) - 1.0);
+    _sortedParticles[id.x].pressure = max(0.0f, p);
+}
+
+[numthreads(256,1,1)]
+void ComputeNormals(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    float3 pos = _sortedParticles[id.x].position;
+    int3 cell = GetCell(pos);
+    float3 normal = float3(0, 0, 0);
+
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+
+                for (uint t = start; t < end; ++t)
+                {
+                    if (id.x == t) continue;
+                    float3 diff = pos - _sortedParticles[t].position;
+                    float dist = length(diff);
+                    if (dist > 1e-6 && dist < h)
+                    {
+                        normal += (particleMass / _sortedParticles[t].density) * gradSpiky(diff, dist);
+                    }
+                }
+            }
+        }
+    }
+
+    _particleNormals[id.x] = h * normal;
+}
+
+[numthreads(256,1,1)]
+void ComputeForces(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    Particle p_i = _sortedParticles[id.x];
+    int3 cell = GetCell(p_i.position);
+
+    float mass2 = particleMass * particleMass;
+
+    float3 F_pressure = float3(0, 0, 0);
+    float3 F_visc     = float3(0, 0, 0);
+    float3 F_surface  = float3(0, 0, 0);
+    float3 F_adhesion = float3(0, 0, 0);
+
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+
+                for (uint t = start; t < end; ++t)
+                {
+                    if (id.x == t) continue;
+
+                    Particle p_j = _sortedParticles[t];
+                    float3 diff = p_i.position - p_j.position;
+                    float dist = length(diff);
+
+                    if (dist > 1e-6 && dist < h)
+                    {
+                        float3 gradW = gradSpiky(diff, dist);
+
+                        // Pressure force (symmetric form)
+                        float pressureTerm = (p_i.pressure / (p_i.density * p_i.density))
+                                           + (p_j.pressure / (p_j.density * p_j.density));
+                        F_pressure += -mass2 * pressureTerm * gradW;
+
+                        // Viscosity force
+                        float lapW = ViscosityKernelSecondDerivative(dist);
+                        F_visc += viscosity * mass2 * ((p_j.velocity - p_i.velocity) / p_j.density) * lapW;
+
+                        // Surface tension (cohesion + curvature)
+                        if (enableSurfaceTension == 1)
+                        {
+                            float K_ij = restDensity / max(p_i.density + p_j.density, 1e-6);
+                            float wc = CohesionKernel(dist);
+                            if (wc > 0)
+                            {
+                                float3 dir = diff / dist;
+                                F_surface += K_ij * (-alpha_cohesion * particleMass * wc * dir);
+                            }
+
+                            float3 n_i = _particleNormals[id.x];
+                            float3 n_j = _particleNormals[t];
+                            float c_i = length(n_i);
+                            float c_j = length(n_j);
+                            if (c_i > 0.1 && c_j > 0.1)
+                            {
+                                F_surface += K_ij * (-gamma_curvature * particleMass * c_i * (n_i - n_j));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Adhesion to the collision sphere (attracts fluid in the h/2..h shell)
+    float3 toCenter = p_i.position - spherePosition;
+    float distToCenter = length(toCenter);
+    if (distToCenter > 1e-6)
+    {
+        float3 boundaryPoint = spherePosition + (sphereRadius * toCenter / distToCenter);
+        float r = length(p_i.position - boundaryPoint);
+        float w = AdhesionKernel(r);
+        if (w > 0.0)
+        {
+            float3 dir = normalize(p_i.position - boundaryPoint);
+            F_adhesion -= beta_adhesion * mass2 * w * dir;
+        }
+    }
+
+    _sortedParticles[id.x].currentForce = float3(0, -9.81 * particleMass, 0)
+                                        + F_pressure + F_visc + F_surface + F_adhesion;
+}
+
+[numthreads(256,1,1)]
+void ComputeXSPH(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount || enableXSPH == 0) return;
+
+    Particle p_i = _sortedParticles[id.x];
+    int3 cell = GetCell(p_i.position);
+    float3 dv = float3(0, 0, 0);
+
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+
+                for (uint t = start; t < end; ++t)
+                {
+                    if (id.x == t) continue;
+                    Particle p_j = _sortedParticles[t];
+                    float3 diff = p_i.position - p_j.position;
+                    float r2 = dot(diff, diff);
+                    if (r2 < h2)
+                    {
+                        float w = Wpoly6(r2);
+                        dv += (particleMass / p_j.density) * (p_j.velocity - p_i.velocity) * w;
+                    }
+                }
+            }
+        }
+    }
+
+    _xsphDelta[id.x] = dv;
+}
+
+[numthreads(256,1,1)]
+void ApplyXSPH(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount || enableXSPH == 0) return;
+    _sortedParticles[id.x].velocity += xsphAlpha * _xsphDelta[id.x];
+}
+
+[numthreads(256,1,1)]
+void ComputeVorticity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount || enableVorticity == 0) return;
+
+    Particle p_i = _sortedParticles[id.x];
+    int3 cell = GetCell(p_i.position);
+    float3 omega = float3(0, 0, 0);
+
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+
+                for (uint t = start; t < end; ++t)
+                {
+                    if (id.x == t) continue;
+                    Particle p_j = _sortedParticles[t];
+                    float3 diff = p_i.position - p_j.position;
+                    float dist = length(diff);
+                    if (dist > 1e-6 && dist < h)
+                    {
+                        float3 gradW = gradSpiky(diff, dist);
+                        float3 v_ij = p_j.velocity - p_i.velocity;
+                        omega += (particleMass / p_j.density) * cross(v_ij, gradW);
+                    }
+                }
+            }
+        }
+    }
+
+    _vorticity[id.x] = omega;
+}
+
+[numthreads(256,1,1)]
+void ApplyVorticityConfinement(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount || enableVorticity == 0) return;
+
+    Particle p_i = _sortedParticles[id.x];
+    int3 cell = GetCell(p_i.position);
+    float3 eta = float3(0, 0, 0);
+
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+
+                for (uint t = start; t < end; ++t)
+                {
+                    if (id.x == t) continue;
+                    float3 diff = p_i.position - _sortedParticles[t].position;
+                    float dist = length(diff);
+                    if (dist > 1e-6 && dist < h)
+                    {
+                        float3 gradW = gradSpiky(diff, dist);
+                        float wmag = length(_vorticity[t]);
+                        eta += (particleMass / _sortedParticles[t].density) * wmag * gradW;
+                    }
+                }
+            }
+        }
+    }
+
+    float etaLen = length(eta);
+    if (etaLen > 1e-6)
+    {
+        float3 N = normalize(eta);
+        float3 omega_i = _vorticity[id.x];
+        float3 Fv = vorticityEps * cross(N, omega_i);
+        _sortedParticles[id.x].currentForce += particleMass * Fv;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PCISPH: iterative pressure projection on the collision-free grid.
+// Reuses _sortedParticles + cell ranges. Predicted position/velocity/accel live
+// in separate sorted-slot buffers so the 44-byte Particle struct (and the
+// renderer binding) is untouched. Neighbour sets come from the grid built on
+// CURRENT positions; predicted positions are used only to evaluate distances.
+// ---------------------------------------------------------------------------
+
+// True density at current positions (no Tait pressure).
+[numthreads(256,1,1)]
+void PCIComputeDensity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    float3 pos = _sortedParticles[id.x].position;
+    int3 cell = GetCell(pos);
+    float rho = 0.0;
+
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+                for (uint t = start; t < end; ++t)
+                {
+                    float3 diff = pos - _sortedParticles[t].position;
+                    float r2 = dot(diff, diff);
+                    if (r2 < h2) rho += particleMass * Wpoly6(r2);
+                }
+            }
+        }
+    }
+    _sortedParticles[id.x].density = max(rho, 1e-6);
+}
+
+// Gravity + viscosity + surface tension (everything except pressure). Resets pressure.
+[numthreads(256,1,1)]
+void PCINonPressureForces(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    Particle p_i = _sortedParticles[id.x];
+    int3 cell = GetCell(p_i.position);
+    float mass2 = particleMass * particleMass;
+
+    float3 F_visc     = float3(0, 0, 0);
+    float3 F_surface  = float3(0, 0, 0);
+    float3 F_adhesion = float3(0, 0, 0);
+
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+                for (uint t = start; t < end; ++t)
+                {
+                    if (id.x == t) continue;
+                    Particle p_j = _sortedParticles[t];
+                    float3 diff = p_i.position - p_j.position;
+                    float dist = length(diff);
+                    if (dist > 1e-6 && dist < h)
+                    {
+                        float lapW = ViscosityKernelSecondDerivative(dist);
+                        F_visc += viscosity * mass2 * ((p_j.velocity - p_i.velocity) / p_j.density) * lapW;
+
+                        if (enableSurfaceTension == 1)
+                        {
+                            float K_ij = restDensity / max(p_i.density + p_j.density, 1e-6);
+                            float wc = CohesionKernel(dist);
+                            if (wc > 0)
+                            {
+                                float3 dir = diff / dist;
+                                F_surface += K_ij * (-alpha_cohesion * particleMass * wc * dir);
+                            }
+                            float3 n_i = _particleNormals[id.x];
+                            float3 n_j = _particleNormals[t];
+                            float c_i = length(n_i);
+                            float c_j = length(n_j);
+                            if (c_i > 0.1 && c_j > 0.1)
+                                F_surface += K_ij * (-gamma_curvature * particleMass * c_i * (n_i - n_j));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Adhesion to the collision sphere (same as WCSPH path)
+    float3 toCenter = p_i.position - spherePosition;
+    float distToCenter = length(toCenter);
+    if (distToCenter > 1e-6)
+    {
+        float3 boundaryPoint = spherePosition + (sphereRadius * toCenter / distToCenter);
+        float r = length(p_i.position - boundaryPoint);
+        float w = AdhesionKernel(r);
+        if (w > 0.0)
+        {
+            float3 dir = normalize(p_i.position - boundaryPoint);
+            F_adhesion -= beta_adhesion * mass2 * w * dir;
+        }
+    }
+
+    _sortedParticles[id.x].currentForce = float3(0, -9.81 * particleMass, 0)
+                                        + F_visc + F_surface + F_adhesion;
+    _sortedParticles[id.x].pressure = 0.0;
+}
+
+// Predict velocity/position under non-pressure forces only.
+[numthreads(256,1,1)]
+void PCIPredictStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+    Particle p = _sortedParticles[id.x];
+    float3 pv = p.velocity + (p.currentForce / particleMass) * timeStep;
+    _predVel[id.x] = pv;
+    _predPos[id.x] = p.position + pv * timeStep;
+}
+
+// Predicted density -> density error -> incremental pressure. density field is
+// overwritten with predicted density for the pressure-term denominator.
+[numthreads(256,1,1)]
+void PCIPressureUpdate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    float3 origin = _predPos[id.x];
+    int3 cell = GetCell(_sortedParticles[id.x].position);
+    float rho = 0.0;
+
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+                for (uint t = start; t < end; ++t)
+                {
+                    float3 diff = origin - _predPos[t];
+                    float r2 = dot(diff, diff);
+                    if (r2 < h2) rho += particleMass * Wpoly6(r2);
+                }
+            }
+        }
+    }
+
+    _sortedParticles[id.x].density = max(rho, 1e-6);
+    float err = rho - restDensity;
+    float newP = _sortedParticles[id.x].pressure + _pcisphDelta * err;
+    _sortedParticles[id.x].pressure = max(0.0, newP);
+}
+
+// Pressure ACCELERATION at predicted positions -> own accel buffer (race-free).
+[numthreads(256,1,1)]
+void PCIPressureAccel(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    float3 origin = _predPos[id.x];
+    float pi_rho = _sortedParticles[id.x].density;
+    float pi_term = _sortedParticles[id.x].pressure / (pi_rho * pi_rho);
+    int3 cell = GetCell(_sortedParticles[id.x].position);
+
+    float3 a_p = float3(0, 0, 0);
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+                for (uint t = start; t < end; ++t)
+                {
+                    if (id.x == t) continue;
+                    float3 diff = origin - _predPos[t];
+                    float dist = length(diff);
+                    if (dist > 1e-6 && dist < h)
+                    {
+                        float pj_rho = _sortedParticles[t].density;
+                        float term = pi_term + _sortedParticles[t].pressure / (pj_rho * pj_rho);
+                        a_p += -particleMass * term * gradSpiky(diff, dist);
+                    }
+                }
+            }
+        }
+    }
+    _predAccel[id.x] = a_p;
+}
+
+// Re-predict position from the ORIGINAL position + base (non-pressure) velocity plus
+// the current pressure acceleration. Jacobi style: does NOT accumulate across
+// iterations (that double-integrates time). _predVel holds the base velocity and is
+// left untouched; pressure accumulates in .pressure, so _predAccel already reflects
+// the full accumulated pressure each iteration. Own slot only -> race-free.
+[numthreads(256,1,1)]
+void PCIApplyAccel(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+    float3 predVelTotal = _predVel[id.x] + _predAccel[id.x] * timeStep;
+    _predPos[id.x] = _sortedParticles[id.x].position + predVelTotal * timeStep;
+}
+
+// Final pressure FORCE (mass^2 convention, matches WCSPH) -> added to currentForce.
+[numthreads(256,1,1)]
+void PCIComputePressureForce(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    float3 origin = _predPos[id.x];
+    float mass2 = particleMass * particleMass;
+    float pi_rho = _sortedParticles[id.x].density;
+    float pi_term = _sortedParticles[id.x].pressure / (pi_rho * pi_rho);
+    int3 cell = GetCell(_sortedParticles[id.x].position);
+
+    float3 F_pressure = float3(0, 0, 0);
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+                for (uint t = start; t < end; ++t)
+                {
+                    if (id.x == t) continue;
+                    float3 diff = origin - _predPos[t];
+                    float dist = length(diff);
+                    if (dist > 1e-6 && dist < h)
+                    {
+                        float pj_rho = _sortedParticles[t].density;
+                        float term = pi_term + _sortedParticles[t].pressure / (pj_rho * pj_rho);
+                        F_pressure += -mass2 * term * gradSpiky(diff, dist);
+                    }
+                }
+            }
+        }
+    }
+    _sortedParticles[id.x].currentForce += F_pressure;
+}
+
+[numthreads(256,1,1)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    Particle p = _sortedParticles[id.x];
+
+    // NaN guard: a single blown-up particle must not poison the rest via the neighbour sums.
+    // Park it at the box centre at rest instead of letting Inf/NaN propagate.
+    if (any(isnan(p.currentForce)) || any(isnan(p.velocity)) || any(isnan(p.position)))
+    {
+        p.currentForce = float3(0, 0, 0);
+        p.velocity = float3(0, 0, 0);
+        p.position = float3(0, 0, 0);
+    }
+
+    // Symplectic Euler
+    p.velocity += (p.currentForce / particleMass) * timeStep;
+
+    // Air friction / wind. Air-fluid coupling in graphics SPH is a drag force toward the
+    // ambient air velocity: dv/dt = -k (v - v_air)  (Koschier et al. SPH tutorial p37;
+    // Gissler et al. 2017 "Approximate air-fluid interactions for SPH"). Integrated
+    // implicitly (exponential) so it is unconditionally stable for any k*dt:
+    //   v_new = v_air + (v - v_air) * exp(-k*dt).
+    // Air only touches the exposed surface, so by default only density-deficient
+    // (free-surface) particles feel it; interior particles are shielded.
+    if (enableAirDrag == 1)
+    {
+        float surf = 1.0;
+        if (airDragSurfaceOnly == 1)
+        {
+            float sd = max(airDragSurfaceThreshold * restDensity, 1e-6);
+            surf = saturate(1.0 - p.density / sd); // 0 in the bulk, ->1 at the free surface
+        }
+        if (surf > 0.0)
+        {
+            float3 vRel = p.velocity - windVelocity;
+            p.velocity = windVelocity + vRel * exp(-airDragCoeff * surf * timeStep);
+        }
+    }
+
+    // Velocity clamp (CFL backstop): never advect more than ~half a support radius per step.
+    // Stops a transient overlap from launching particles across the domain and keeps large
+    // particle counts stable even if a few cells momentarily over-pack.
+    float maxSpeed = 0.5 * h / max(timeStep, 1e-6);
+    float spd = length(p.velocity);
+    if (spd > maxSpeed) p.velocity *= (maxSpeed / spd);
+
+    p.position += p.velocity * timeStep;
+
+    // Axis-aligned box walls
+    float3 halfBox = boxSize * 0.5;
+    float3 minB = -halfBox + particleRadius;
+    float3 maxB =  halfBox - particleRadius;
+
+    float e = saturate(-boundDamping);
+
+    if (p.position.x < minB.x) { p.position.x = minB.x; if (p.velocity.x < 0) p.velocity.x *= boundDamping; }
+    if (p.position.x > maxB.x) { p.position.x = maxB.x; if (p.velocity.x > 0) p.velocity.x *= boundDamping; }
+    if (p.position.y < minB.y) { p.position.y = minB.y; if (p.velocity.y < 0) p.velocity.y *= boundDamping; }
+    if (p.position.y > maxB.y) { p.position.y = maxB.y; if (p.velocity.y > 0) p.velocity.y *= boundDamping; }
+    if (p.position.z < minB.z) { p.position.z = minB.z; if (p.velocity.z < 0) p.velocity.z *= boundDamping; }
+    if (p.position.z > maxB.z) { p.position.z = maxB.z; if (p.velocity.z > 0) p.velocity.z *= boundDamping; }
+
+    // Sphere obstacle
+    float3 toP = p.position - spherePosition;
+    float d = length(toP);
+    float rMin = sphereRadius + particleRadius;
+    if (d < rMin && d > 1e-6)
+    {
+        float3 nrm = toP / d;
+        p.position = spherePosition + nrm * rMin;
+        float vn = dot(p.velocity, nrm);
+        if (vn < 0) p.velocity -= (1.0 + e) * vn * nrm;
+    }
+
+    // Re-clamp to the box: the sphere push above can shove a particle through a wall when the
+    // sphere is dragged into a corner. Keep the fluid contained no matter where the sphere is.
+    p.position = clamp(p.position, minB, maxB);
+
+    // Write back to the master buffer at this particle's stable index
+    uint originalIndex = _particleIndices[id.x];
+    _particles[originalIndex] = p;
+}

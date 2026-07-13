@@ -1,0 +1,20 @@
+#include "SurfaceTension.compute"
+#ifndef SURFACE_TENSION_INCLUDED
+#define SURFACE_TENSION_INCLUDED
+
+// Surface tension smoothing kernel laplacian (∇²W)
+float SurfaceTensionKernelLaplacian(float r, float h)
+{
+    if (r >= h) return 0.0;
+    return (45.0 / (pi * pow(h, 6))) * (h - r);
+}
+
+// Surface tension force between two particles
+float3 ComputeSurfaceTensionForce(float3 r_ij, float dist, float mass_j, float rho_j, float3 normal, float laplacian, float sigma)
+{
+    float normLen = length(normal);
+    if (normLen < 0.01) return float3(0, 0, 0);
+    return -sigma * laplacian * (normal / normLen);
+}
+
+#endif // SURFACE_TENSION_INCLUDED

@@ -1,0 +1,179 @@
+Shader "Hidden/Fluid/ParticlesThickness"
+{
+    Properties{}
+    SubShader
+    {
+        Tags { "RenderType"="Opaque" "Queue"="Transparent" }
+        Cull Off
+        ZWrite Off
+        ZTest Always
+
+        // RT0: thickness = additive sum
+        Blend   0 One One
+        BlendOp 0 Add
+
+        // RT1: front depth (view-space z) = MIN
+        Blend   1 One One
+        BlendOp 1 Max
+
+        Pass 
+        {
+            HLSLPROGRAM
+            #include "UnityCG.cginc"
+            #pragma target 4.5
+            #pragma vertex   vert
+            #pragma fragment frag
+
+            struct Particle
+            {
+                float pressure;
+                float density;
+                float3 currentForce;
+                float3 velocity;
+                float3 position;
+            };
+
+            StructuredBuffer<Particle> _particlesBuffer;
+            float _ParticleRadius;
+            float4x4 _VP;
+            float3 _CamRight, _CamUP; // world-space camera axes
+
+            struct VSOut{
+                float4 pos : SV_POSITION;
+                float2 quad : TEXCOORD0; // [-1,1] quad coords
+                float3 centerVS : TEXCOORD1; // particle center in view space
+                float radius: TEXCOORD2; // world radius
+            };
+
+            VSOut vert(uint id: SV_VertexID, uint inst: SV_InstanceID)
+            {
+                static const float2 corners[6] = {
+                    float2(-1,-1), float2(1,-1), float2(1,1),
+                    float2(-1,-1), float2(1,1), float2(-1,1)
+                }; 
+
+                VSOut o;
+                float3 Cw= _particlesBuffer[inst].position; // particle center in world space
+                float2 q = corners[id]; // quad corner in [-1,1] space
+
+                float r = _ParticleRadius;
+                float3 Pw = Cw + r * (q.x * _CamRight + q.y * _CamUP); // quad corner in world space
+
+                float4 Pc = mul(_VP, float4(Pw,1)); // quad corner in clip space
+                o.pos = Pc;
+                o.quad = q;
+
+                float4 Cv = mul(UNITY_MATRIX_V, float4(Cw,1)); // particle center in view space
+                o.centerVS = Cv.xyz;
+                o.radius = r;
+                return o;
+            }
+
+            struct PSOut{
+                float4 thickness : SV_Target0;
+                float4 depth : SV_Target1;
+            };
+
+            PSOut frag(VSOut i)
+            {
+                PSOut o;
+                
+                float d2 = dot(i.quad, i.quad);
+                if (d2 > 1.0){
+                    discard;
+                }
+
+                float dw = i.radius * sqrt(d2); // world-space distance from center
+                float a = sqrt(max(1e-8, i.radius * i.radius - dw * dw));
+
+                float thickness = 2.0 * a; // thickness in world space
+
+                float zFront = i.centerVS.z + a; // front z in view space
+
+                o.thickness = float4(thickness, 0, 0, 1);
+                o.depth = float4(zFront, 0, 0, 1);
+                return o;
+            }
+            ENDHLSL
+        }
+    }
+    FallBack Off
+}
+
+Shader "Hidden/Fluid/Composite"
+{
+    Properties {
+        _SceneTex("SceneTex", 2D) = "black" {}
+        _DepthTex("Fluid Front Depth (view-space z)", 2D) = "black" {}
+        _ThicknessTex("ThicknessTex", 2D) = "black" {}
+        _Eta("IOR (water~1.33)", Float) = 1.33 
+        _SigmaA("Absoption coeff", Vector) = (0.15, 0.06, 0.03, 0) // RGB 
+        _RefractScale("Refraction scale", Float) = 0.02
+        _F0("Base reflectivity", Float) = 0.02
+    }
+
+    SubShader
+    {
+        Tags{ "RenderType"="Opaque" "Queue"="Transparent+100" }
+        Cull Off
+        ZWrite Off
+        ZTest Always
+
+        Pass
+        {
+            HLSLPROGRAM
+            #include "UnityCG.cginc"
+            #pragma target 4.5
+            #pragma vertex   vert_img
+            #pragma fragment frag
+
+            sampler2D _SceneTex, _DepthTex, _ThicknessTex;
+            float4 _SceneTex_TexelSize;
+            float _Eta, _RefractScale, _F0;
+            float3 _SigmaA;
+
+            float4x4 _Proj;
+            float4x4 _InvP;
+
+            float3 ReconstructViewPos(float2 uv, float zView)
+            {
+                float2 ndc = uv * 2 - 1;
+                float vx = ndc.x * zView / _Proj._m00;
+                float vy = ndc.y * zView / _Proj._m11;
+                return float3(vx, vy, zView);
+            }
+
+            float4 frag(v2f_img i) : SV_Target
+            {
+                float2 uv = i.uv;
+                float zV = tex2D(_DepthTex, uv).r; // view-space z
+                if (zV >= 1e19){
+                    return tex2D(_SceneTex, uv); // no fluid here
+                }
+
+                float3 P = ReconstructViewPos(uv, zV); // view-space position
+                float zdx = ddx(zV), zdy = ddy(zV);
+                float3 Px = ReconstructViewPos(uv + float2(_SceneTex_TexelSize.x, 0), zV + zdx); // view-space position at right pixel
+                float3 Py = ReconstructViewPos(uv + float2(0, _SceneTex_TexelSize.y), zV + zdy); // view-space position at top pixel
+                float3 N = normalize(cross(Py - P, Px - P)); // normal in view space
+
+                float T = tex2D(_ThicknessTex, uv).r; // thickness in world space
+                float3 transmittance = exp(-_SigmaA * T); // Beer's law
+
+                float3 V = normalize(-P); // view vector in view space
+                float F = _F0 + (1 - _F0) * pow(1 - saturate(dot(N, V)), 5); // Schlick's approx
+
+                // cheap refraction: offset by normal
+                float2 rUV = uv + _RefractScale * (N.xy / max(-N.z, 0.05)); // view-space to screen-space: divide by -z
+                float3 refr = tex2D(_SceneTex, rUV).rgb * transmittance; // refracted color
+
+                float3 refl = tex2D(_SceneTex, reflect(-V, N).xy * 0.5 + 0.5).rgb; // reflected color
+
+                float3 color = lerp(refr, refl, F);
+                return float4(color, 1);
+            }
+            ENDHLSL
+        }
+    }
+    FallBack Off
+}
