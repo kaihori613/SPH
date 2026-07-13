@@ -1,23 +1,34 @@
-# SPH-Unity-Implementation
+# Smoothed Particle Hydrodynamics (Unity)
 
-Very basic implementation of realtime fluid simulation using the SPH algorithm.
+Real-time GPU fluid simulation using SPH, implemented as Unity compute shaders.
+
+## Features
+
+- **Two solvers** (toggle via `SolverMode`): WCSPH (Tait EOS) and PCISPH (iterative pressure projection)
+- **Collision-free neighbor search**: linear grid → bitonic sort → cell start/end → reorder into a sorted buffer
+- **Fidelity layers** (all runtime-tunable): surface tension (cohesion/curvature/adhesion), XSPH viscosity, vorticity confinement
+- **Air friction / wind**: relative-velocity air drag on the free surface (`dv/dt = -k(v - v_air)`, implicit/stable)
+- **Stability**: CFL sound-speed auto-substepping, NaN guard, velocity clamp, particle-count cap
 
 ## File Breakdown
 
-- `Raymarching.compute` : A Compute Shader used for the Ray-marching (simplified version from Sebastian Lague) 
-- `SPHComputeShader.compute` : A Compute Shader running SPH w/ various kernels that operate on different segments of SPH
-- `SPH.cs` - Controls the SPH Compute Shader
-- `FluidRayMarching.cs` - Controls the Ray Marching Compute Shader
+- `Assets/Scripts/SPH.cs` — main solver driver (buffers, dispatch loop, substepping, diagnostics)
+- `Assets/Shaders/SPHCompute.compute` — all SPH compute kernels (density/pressure, forces, grid, PCISPH, integration, air drag)
+- `Assets/Scripts/FluidScreenSpaceRenderer.cs` — screen-space fluid rendering
+- `Assets/Scripts/FluidRayMarching.cs` — ray-marched rendering alternative
 
-## WIP
+## Air Friction / Wind controls (Inspector)
 
-- Optimization of SPH to hash neighbours so that SPH is not n^2 
-- Adding refraction & transparency to visuals
-- Adding physical interaction between a rigidbody & water
+| Field | Default | Purpose |
+|---|---|---|
+| `enableAirDrag` | off | master toggle |
+| `airDragCoeff` | 1.0 | drag rate k (1/s) |
+| `windVelocity` | (0,0,0) | ambient air velocity — non-zero = wind |
+| `airDragSurfaceOnly` | true | only exposed surface particles feel the air |
+| `airDragSurfaceThreshold` | 0.9 | density fraction below which a particle counts as surface |
 
-# Version 1
+## Credits
 
-Contains basic ray marching & very un-optimized SPH. 
-
-![sph-demo](https://user-images.githubusercontent.com/25098044/233352440-c5178813-5c8e-4aff-b07a-3a9e3f14c682.gif)
-
+This project started from [AJTech2002/Smoothed-Particle-Hydrodynamics](https://github.com/AJTech2002/Smoothed-Particle-Hydrodynamics)
+(MIT-licensed) and has since diverged substantially — adding PCISPH, the collision-free grid neighbor search,
+surface tension / XSPH / vorticity, air drag & wind, and CFL substepping. The original `LICENSE` is retained.
