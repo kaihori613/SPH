@@ -120,6 +120,14 @@ float diffuseBuoyancy, diffuseDrag;
 uint _wangHash(uint s) { s = (s ^ 61u) ^ (s >> 16); s *= 9u; s ^= s >> 4; s *= 0x27d4eb2du; s ^= s >> 15; return s; }
 float _rand01(inout uint state) { state = _wangHash(state); return state * (1.0 / 4294967296.0); }
 
+// Akinci 2012 boundary particles (static walls). Read-only, with a precomputed grid built once
+// on the CPU over the SAME cell indexing as the fluid grid. Psi = rho0 * per-particle volume.
+StructuredBuffer<float3> _boundaryPositions;
+StructuredBuffer<float>  _boundaryPsi;
+StructuredBuffer<uint>   _boundaryCellStarts;
+StructuredBuffer<uint>   _boundaryCellEnds;
+int enableBoundary;
+
 // Sort state
 int block;
 int dim;
@@ -295,6 +303,29 @@ void ComputeDensityPressure(uint3 id : SV_DispatchThreadID)
         }
     }
 
+    // Akinci boundary contribution: rho_i += sum_b Psi_b W(x_i - x_b).
+    if (enableBoundary == 1)
+    {
+        for (int bi = -1; bi <= 1; bi++){
+            for (int bj = -1; bj <= 1; bj++){
+                for (int bk = -1; bk <= 1; bk++){
+                    int3 n = cell + int3(bi, bj, bk);
+                    if (any(n < 0) || any(n >= _gridRes)) continue;
+                    uint cIdx = CellLinear(n);
+                    uint start = _boundaryCellStarts[cIdx];
+                    uint end   = _boundaryCellEnds[cIdx];
+                    if (start == 0xffffffffu) continue;
+                    for (uint t = start; t < end; ++t)
+                    {
+                        float3 diff = pos - _boundaryPositions[t];
+                        float r2 = dot(diff, diff);
+                        if (r2 < h2) rho += _boundaryPsi[t] * Wpoly6(r2);
+                    }
+                }
+            }
+        }
+    }
+
     float rhoSafe = max(rho, 1e-6);
     _sortedParticles[id.x].density = rhoSafe;
 
@@ -409,6 +440,32 @@ void ComputeForces(uint3 id : SV_DispatchThreadID)
                                 F_surface += K_ij * (-gamma_curvature * particleMass * c_i * (n_i - n_j));
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // Akinci boundary pressure: one-sided wall push using only the fluid's own pressure.
+    // F_i += -m_i * sum_b Psi_b * (p_i / rho_i^2) * gradW(x_i - x_b).
+    if (enableBoundary == 1)
+    {
+        float pi_over_rho2 = p_i.pressure / (p_i.density * p_i.density);
+        for (int bi = -1; bi <= 1; bi++){
+            for (int bj = -1; bj <= 1; bj++){
+                for (int bk = -1; bk <= 1; bk++){
+                    int3 n = cell + int3(bi, bj, bk);
+                    if (any(n < 0) || any(n >= _gridRes)) continue;
+                    uint cIdx = CellLinear(n);
+                    uint start = _boundaryCellStarts[cIdx];
+                    uint end   = _boundaryCellEnds[cIdx];
+                    if (start == 0xffffffffu) continue;
+                    for (uint t = start; t < end; ++t)
+                    {
+                        float3 diff = p_i.position - _boundaryPositions[t];
+                        float dist = length(diff);
+                        if (dist > 1e-6 && dist < h)
+                            F_pressure += -particleMass * _boundaryPsi[t] * pi_over_rho2 * gradSpiky(diff, dist);
                     }
                 }
             }

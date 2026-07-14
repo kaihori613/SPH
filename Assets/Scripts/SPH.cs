@@ -116,6 +116,16 @@ public class SPH : MonoBehaviour
     [Range(0.5f, 1.0f)]
     public float airDragSurfaceThreshold = 0.9f;
 
+    [Header("Boundary Particles (Akinci 2012)")]
+    [Tooltip("Sample the box walls with boundary particles that contribute to density and push back with pressure (fixes wall density deficiency). Off by default; toggle to A/B against the analytic clamp. Read at Awake, so change it before entering play mode.")]
+    public bool enableBoundaryParticles = false;
+    [Range(1, 4)]
+    [Tooltip("Wall sampling depth. More layers = fuller support near walls (and more boundary particles).")]
+    public int boundaryLayers = 2;
+    [Range(0.5f, 1.5f)]
+    [Tooltip("Boundary sample spacing as a fraction of fluid spacing (2*particleRadius). <1 = denser walls.")]
+    public float boundarySpacingScale = 1.0f;
+
     [Header("Diffuse Particles (Foam / Spray / Bubbles)")]
     [Tooltip("Ihmsen-2012 diffuse markers spawned where the fluid is aerated. Off by default.")]
     public bool enableDiffuse = false;
@@ -183,6 +193,14 @@ public class SPH : MonoBehaviour
     private ComputeBuffer _predPos;    // PCISPH predicted position (sorted-slot)
     private ComputeBuffer _predVel;    // PCISPH predicted velocity (sorted-slot)
     private ComputeBuffer _predAccel;  // PCISPH pressure acceleration scratch (sorted-slot)
+
+    // Akinci boundary particles (static walls)
+    private ComputeBuffer _boundaryPositions;
+    private ComputeBuffer _boundaryPsi;
+    private ComputeBuffer _boundaryCellStarts;
+    private ComputeBuffer _boundaryCellEnds;
+    private int _boundaryCount;
+    private bool _boundaryReady;
 
     // Diffuse particles (foam/spray/bubbles)
     private ComputeBuffer _diffuseBuffer;   // fixed pool, ring-buffer allocation
@@ -273,7 +291,180 @@ public class SPH : MonoBehaviour
 
         SpawnParticleInBox();
         SetupComputeBuffers();
+        SetupBoundary();
         SetupDiffuse();
+    }
+
+    // ---- Akinci boundary particles (static walls) -------------------------------------------
+    private int BoundaryCellLinear(int cx, int cy, int cz)
+        => cx + cy * _gridRes.x + cz * _gridRes.x * _gridRes.y;
+
+    private int BoundaryCellOf(Vector3 p, float invH)
+    {
+        Vector3 half = boxSize * 0.5f;
+        Vector3 g = (p + half) * invH;
+        int cx = Mathf.Clamp(Mathf.FloorToInt(g.x), 0, _gridRes.x - 1);
+        int cy = Mathf.Clamp(Mathf.FloorToInt(g.y), 0, _gridRes.y - 1);
+        int cz = Mathf.Clamp(Mathf.FloorToInt(g.z), 0, _gridRes.z - 1);
+        return BoundaryCellLinear(cx, cy, cz);
+    }
+
+    // Samples the 6 box faces, computes each particle's Akinci Psi (rho0 * volume) from its
+    // boundary neighbours, sorts them into the fluid grid, and uploads. Built once at startup
+    // because the walls are static. Independent of the fluid buffers.
+    // Bind 1-element placeholders so the density/force kernels always have the boundary buffers
+    // bound (they're only read when enableBoundary==1, which stays 0 until _boundaryReady).
+    private void BindBoundaryDummies()
+    {
+        _boundaryPositions = new ComputeBuffer(1, sizeof(float) * 3);
+        _boundaryPsi = new ComputeBuffer(1, sizeof(float));
+        _boundaryCellStarts = new ComputeBuffer(1, sizeof(uint));
+        _boundaryCellEnds = new ComputeBuffer(1, sizeof(uint));
+        _boundaryCellStarts.SetData(new uint[] { 0xffffffffu });
+        _boundaryCellEnds.SetData(new uint[] { 0xffffffffu });
+        foreach (int k in new[] { densityPressureKernel, computeForceKernel })
+        {
+            shader.SetBuffer(k, "_boundaryPositions", _boundaryPositions);
+            shader.SetBuffer(k, "_boundaryPsi", _boundaryPsi);
+            shader.SetBuffer(k, "_boundaryCellStarts", _boundaryCellStarts);
+            shader.SetBuffer(k, "_boundaryCellEnds", _boundaryCellEnds);
+        }
+        _boundaryReady = false;
+    }
+
+    private void SetupBoundary()
+    {
+        // Sampling the walls and solving Psi costs real CPU time and four GPU buffers, so skip it
+        // entirely when the feature is off. Toggling it on mid-play therefore does nothing; the
+        // walls are only built at Awake.
+        if (!enableBoundaryParticles || _gridCellCount <= 0) { BindBoundaryDummies(); return; }
+
+        float spacing = 2f * particleRadius;
+        float hTarget = 2.0f * spacing;
+        float hValue = supportRadius > 0f ? supportRadius : hTarget;
+        if (clampSupportRadius) hValue = Mathf.Clamp(hValue, 1.8f * spacing, 2.4f * spacing);
+        float invH = 1f / hValue;
+        float h2 = hValue * hValue;
+        float poly6C = 315f / (64f * Mathf.PI * Mathf.Pow(hValue, 9f));
+        float bs = Mathf.Max(0.1f, spacing * boundarySpacingScale);
+
+        // 1. Sample the 6 faces, boundaryLayers deep (each layer offset outward into the solid).
+        List<Vector3> pts = new List<Vector3>();
+        Vector3 half = boxSize * 0.5f;
+        int cx = Mathf.Max(2, Mathf.RoundToInt(boxSize.x / bs) + 1);
+        int cy = Mathf.Max(2, Mathf.RoundToInt(boxSize.y / bs) + 1);
+        int cz = Mathf.Max(2, Mathf.RoundToInt(boxSize.z / bs) + 1);
+
+        for (int l = 0; l < Mathf.Max(1, boundaryLayers); l++)
+        {
+            float off = l * bs;
+            for (int a = 0; a < cy; a++)
+                for (int b = 0; b < cz; b++)
+                {
+                    float y = Mathf.Lerp(-half.y, half.y, a / (float)(cy - 1));
+                    float z = Mathf.Lerp(-half.z, half.z, b / (float)(cz - 1));
+                    pts.Add(new Vector3(-half.x - off, y, z));
+                    pts.Add(new Vector3( half.x + off, y, z));
+                }
+            for (int a = 0; a < cx; a++)
+                for (int b = 0; b < cz; b++)
+                {
+                    float x = Mathf.Lerp(-half.x, half.x, a / (float)(cx - 1));
+                    float z = Mathf.Lerp(-half.z, half.z, b / (float)(cz - 1));
+                    pts.Add(new Vector3(x, -half.y - off, z));
+                    pts.Add(new Vector3(x,  half.y + off, z));
+                }
+            for (int a = 0; a < cx; a++)
+                for (int b = 0; b < cy; b++)
+                {
+                    float x = Mathf.Lerp(-half.x, half.x, a / (float)(cx - 1));
+                    float y = Mathf.Lerp(-half.y, half.y, b / (float)(cy - 1));
+                    pts.Add(new Vector3(x, y, -half.z - off));
+                    pts.Add(new Vector3(x, y,  half.z + off));
+                }
+        }
+
+        _boundaryCount = pts.Count;
+        if (_boundaryCount == 0) { BindBoundaryDummies(); return; }
+
+        Vector3[] pos = pts.ToArray();
+        int[] cellOf = new int[_boundaryCount];
+        Dictionary<int, List<int>> cellMap = new Dictionary<int, List<int>>();
+        for (int i = 0; i < _boundaryCount; i++)
+        {
+            int c = BoundaryCellOf(pos[i], invH);
+            cellOf[i] = c;
+            if (!cellMap.TryGetValue(c, out List<int> lst)) { lst = new List<int>(); cellMap[c] = lst; }
+            lst.Add(i);
+        }
+
+        // 2. Psi_b = rho0 / sum_b' W(x_b - x_b')  (sum over boundary neighbours incl. self).
+        float[] psi = new float[_boundaryCount];
+        for (int i = 0; i < _boundaryCount; i++)
+        {
+            int bcx = cellOf[i] % _gridRes.x;
+            int bcy = (cellOf[i] / _gridRes.x) % _gridRes.y;
+            int bcz = cellOf[i] / (_gridRes.x * _gridRes.y);
+            float sum = 0f;
+            for (int dx = -1; dx <= 1; dx++)
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dz = -1; dz <= 1; dz++)
+                    {
+                        int nx = bcx + dx, ny = bcy + dy, nz = bcz + dz;
+                        if (nx < 0 || ny < 0 || nz < 0 || nx >= _gridRes.x || ny >= _gridRes.y || nz >= _gridRes.z) continue;
+                        if (!cellMap.TryGetValue(BoundaryCellLinear(nx, ny, nz), out List<int> lst)) continue;
+                        foreach (int j in lst)
+                        {
+                            float r2 = (pos[i] - pos[j]).sqrMagnitude;
+                            if (r2 < h2) { float t = h2 - r2; sum += poly6C * t * t * t; }
+                        }
+                    }
+            psi[i] = sum > 1e-12f ? restingDensity / sum : 0f;
+        }
+
+        // 3. Sort by cell and build cell start/end over the fluid grid's cell count.
+        int[] order = new int[_boundaryCount];
+        for (int i = 0; i < _boundaryCount; i++) order[i] = i;
+        System.Array.Sort(order, (x, y) => cellOf[x].CompareTo(cellOf[y]));
+
+        Vector3[] sortedPos = new Vector3[_boundaryCount];
+        float[] sortedPsi = new float[_boundaryCount];
+        uint[] starts = new uint[_gridCellCount];
+        uint[] ends = new uint[_gridCellCount];
+        for (int c = 0; c < _gridCellCount; c++) { starts[c] = 0xffffffffu; ends[c] = 0xffffffffu; }
+
+        for (int i = 0; i < _boundaryCount; i++)
+        {
+            int src = order[i];
+            sortedPos[i] = pos[src];
+            sortedPsi[i] = psi[src];
+            int cellNow = cellOf[src];
+            int cellPrev = i == 0 ? -1 : cellOf[order[i - 1]];
+            int cellNext = i == _boundaryCount - 1 ? -1 : cellOf[order[i + 1]];
+            if (cellNow != cellPrev) starts[cellNow] = (uint)i;
+            if (cellNow != cellNext) ends[cellNow] = (uint)(i + 1);
+        }
+
+        // 4. Upload + bind to the WCSPH density and force kernels.
+        _boundaryPositions = new ComputeBuffer(_boundaryCount, sizeof(float) * 3);
+        _boundaryPsi = new ComputeBuffer(_boundaryCount, sizeof(float));
+        _boundaryCellStarts = new ComputeBuffer(_gridCellCount, sizeof(uint));
+        _boundaryCellEnds = new ComputeBuffer(_gridCellCount, sizeof(uint));
+        _boundaryPositions.SetData(sortedPos);
+        _boundaryPsi.SetData(sortedPsi);
+        _boundaryCellStarts.SetData(starts);
+        _boundaryCellEnds.SetData(ends);
+
+        foreach (int k in new[] { densityPressureKernel, computeForceKernel })
+        {
+            shader.SetBuffer(k, "_boundaryPositions", _boundaryPositions);
+            shader.SetBuffer(k, "_boundaryPsi", _boundaryPsi);
+            shader.SetBuffer(k, "_boundaryCellStarts", _boundaryCellStarts);
+            shader.SetBuffer(k, "_boundaryCellEnds", _boundaryCellEnds);
+        }
+
+        _boundaryReady = true;
+        Debug.Log($"[SPH] Boundary particles: {_boundaryCount} samples ({boundaryLayers} layer(s)) over the box walls.");
     }
 
     // Diffuse particle pool + kernels + render material. Independent of the fluid buffers so it
@@ -586,6 +777,8 @@ public class SPH : MonoBehaviour
         shader.SetVector("windVelocity", windVelocity);
         shader.SetInt("airDragSurfaceOnly", airDragSurfaceOnly ? 1 : 0);
         shader.SetFloat("airDragSurfaceThreshold", airDragSurfaceThreshold);
+
+        shader.SetInt("enableBoundary", (enableBoundaryParticles && _boundaryReady) ? 1 : 0);
     }
 
     // Live-tunable diffuse-particle knobs, uploaded when the system is active.
@@ -924,5 +1117,9 @@ public class SPH : MonoBehaviour
         _diffuseBuffer?.Release();
         _diffuseCount?.Release();
         _diffuseArgsBuffer?.Release();
+        _boundaryPositions?.Release();
+        _boundaryPsi?.Release();
+        _boundaryCellStarts?.Release();
+        _boundaryCellEnds?.Release();
     }
 }

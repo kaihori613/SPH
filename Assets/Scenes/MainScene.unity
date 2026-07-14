@@ -209,6 +209,9 @@ MonoBehaviour:
   windVelocity: {x: 0, y: 0, z: 0}
   airDragSurfaceOnly: 1
   airDragSurfaceThreshold: 0.9
+  enableBoundaryParticles: 0
+  boundaryLayers: 2
+  boundarySpacingScale: 1
   enableDiffuse: 1
   maxDiffuse: 40000
   diffuseMaterial: {fileID: 0}
