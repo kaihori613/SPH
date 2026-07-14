@@ -44,6 +44,17 @@ public class SPH : MonoBehaviour
     public float particleRenderSize = 8f;
     public Material material;
 
+    public enum ColorMode { Uniform, Speed, Density }
+    [Tooltip("Uniform = flat color; Speed = blue->red by velocity magnitude (Seb Lague style); Density = by fluid density.")]
+    public ColorMode particleColorMode = ColorMode.Speed;
+    [Tooltip("Value mapped to the blue end of the ramp. Speed: ~0. Density: ~0.9*restingDensity.")]
+    public float colorMin = 0f;
+    [Tooltip("Value mapped to the red end of the ramp. Speed: ~6 m/s. Density: ~1.1*restingDensity.")]
+    public float colorMax = 6f;
+    [Range(0f, 2f)]
+    [Tooltip("Emission strength so the colors glow (0 = lit only).")]
+    public float colorEmission = 0.3f;
+
     [Header("Compute")]
     public ComputeShader shader;
     public Particle[] particles;
@@ -838,12 +849,22 @@ public class SPH : MonoBehaviour
     private static readonly int SizeProperty = Shader.PropertyToID("_size");
     private static readonly int ParticlesBufferProperty = Shader.PropertyToID("_particlesBuffer");
     private static readonly int DiffuseBufferProperty = Shader.PropertyToID("_diffuseBuffer");
+    private static readonly int ColorModeProperty = Shader.PropertyToID("_ColorMode");
+    private static readonly int ColorMinProperty = Shader.PropertyToID("_ColorMin");
+    private static readonly int ColorMaxProperty = Shader.PropertyToID("_ColorMax");
+    private static readonly int EmissionProperty = Shader.PropertyToID("_Emission");
 
     private void Update()
     {
         // Render the master buffer, which Integrate writes back to.
         material.SetFloat(SizeProperty, particleRenderSize);
         material.SetBuffer(ParticlesBufferProperty, _particlesBuffer);
+
+        // Live particle coloring (uniform / speed / density gradient).
+        material.SetFloat(ColorModeProperty, (float)(int)particleColorMode);
+        material.SetFloat(ColorMinProperty, colorMin);
+        material.SetFloat(ColorMaxProperty, colorMax);
+        material.SetFloat(EmissionProperty, colorEmission);
 
         if (showSpheres)
         {
