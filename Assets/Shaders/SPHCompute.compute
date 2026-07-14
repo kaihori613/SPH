@@ -18,6 +18,8 @@
 #pragma kernel PCIPressureAccel
 #pragma kernel PCIApplyAccel
 #pragma kernel PCIComputePressureForce
+#pragma kernel DiffuseGenerate
+#pragma kernel DiffuseAdvect
 
 struct Particle
 {
@@ -94,6 +96,29 @@ float airDragCoeff;             // drag rate k (1/s)
 float3 windVelocity;           // ambient air velocity v_air
 int airDragSurfaceOnly;        // 1 = only exposed free-surface particles feel the air
 float airDragSurfaceThreshold; // fraction of restDensity below which a particle is "surface"
+
+// Diffuse particles (foam/spray/bubbles, Ihmsen 2012)
+struct DiffuseParticle
+{
+    float3 position;
+    float3 velocity;
+    float lifetime;
+    int type;   // -1 inactive, 0 spray, 1 foam, 2 bubble
+};
+RWStructuredBuffer<DiffuseParticle> _diffuseParticles;
+RWStructuredBuffer<uint> _diffuseCount;   // monotonic ring head
+uint maxDiffuse;
+int _diffuseSeed;
+float _diffuseDt;
+float diffuseGenRate, diffuseKEmin, diffuseKEmax, diffuseTrappedAir, diffuseWaveCrest;
+int diffuseMaxSpawnPerParticle;
+float diffuseLifetimeMin, diffuseLifetimeMax;
+float diffuseSprayThreshold, diffuseBubbleThreshold;
+float diffuseBuoyancy, diffuseDrag;
+
+// Small hash RNG (Wang hash) -> uniform float in [0,1)
+uint _wangHash(uint s) { s = (s ^ 61u) ^ (s >> 16); s *= 9u; s ^= s >> 4; s *= 0x27d4eb2du; s ^= s >> 15; return s; }
+float _rand01(inout uint state) { state = _wangHash(state); return state * (1.0 / 4294967296.0); }
 
 // Sort state
 int block;
@@ -878,4 +903,163 @@ void Integrate(uint3 id : SV_DispatchThreadID)
     // Write back to the master buffer at this particle's stable index
     uint originalIndex = _particleIndices[id.x];
     _particles[originalIndex] = p;
+}
+
+// ---------------------------------------------------------------------------
+// Diffuse particles: spray, foam and air bubbles (Ihmsen et al. 2012).
+// Cheap markers generated where the fluid is aerated (fast, converging, or a
+// wave crest), then advected by air drag / the local fluid depending on how
+// much water surrounds them. They do not feed back into the fluid.
+// ---------------------------------------------------------------------------
+
+// Generation: one thread per fluid particle. Estimates a spawn potential from
+// kinetic energy, trapped air (converging neighbours) and wave crests, and
+// appends that many markers into the ring-buffer pool via an atomic head.
+[numthreads(256,1,1)]
+void DiffuseGenerate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    Particle p_i = _sortedParticles[id.x];
+    float speed = length(p_i.velocity);
+    float Ik = saturate((speed - diffuseKEmin) / max(diffuseKEmax - diffuseKEmin, 1e-3));
+    if (Ik <= 0.0) return;
+
+    int3 cell = GetCell(p_i.position);
+    float Ita = 0.0;
+
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+                for (uint t = start; t < end; ++t)
+                {
+                    if (id.x == t) continue;
+                    Particle p_j = _sortedParticles[t];
+                    float3 vij = p_i.velocity - p_j.velocity;
+                    float3 xij = p_i.position - p_j.position;
+                    float lv = length(vij);
+                    float lx = length(xij);
+                    if (lv > 1e-5 && lx > 1e-5 && lx < h)
+                    {
+                        float w = 1.0 - dot(vij / lv, xij / lx); // 0..2, high when converging
+                        Ita += lv * w * (1.0 - lx * invH);
+                    }
+                }
+            }
+        }
+    }
+
+    // Wave crest: a surface particle (large normal) moving outward along its normal.
+    float3 nrm = _particleNormals[id.x];
+    float nlen = length(nrm);
+    float Iwc = 0.0;
+    if (nlen > 0.01 && speed > 1e-4)
+        Iwc = saturate(dot(p_i.velocity / speed, nrm / nlen)) * saturate(nlen);
+
+    float potential = Ik * saturate(diffuseTrappedAir * Ita * 0.1 + diffuseWaveCrest * Iwc);
+    if (potential <= 0.0) return;
+
+    uint seed = _wangHash((uint)(id.x + 1u) * 747796405u + (uint)(_diffuseSeed + 1) * 2891336453u);
+    float fn = diffuseGenRate * potential * (float)diffuseMaxSpawnPerParticle;
+    int nspawn = clamp((int)floor(fn + _rand01(seed)), 0, diffuseMaxSpawnPerParticle); // stochastic rounding
+
+    for (int s = 0; s < nspawn; s++)
+    {
+        uint slotBase;
+        InterlockedAdd(_diffuseCount[0], 1u, slotBase);
+        uint slot = slotBase % maxDiffuse;
+
+        float3 rv = float3(_rand01(seed) * 2.0 - 1.0, _rand01(seed) * 2.0 - 1.0, _rand01(seed) * 2.0 - 1.0);
+        DiffuseParticle d;
+        d.position = p_i.position + rv * (0.5 * h);
+        d.velocity = p_i.velocity + rv * (0.3 * speed);
+        d.lifetime = lerp(diffuseLifetimeMin, diffuseLifetimeMax, _rand01(seed));
+        d.type = 1;
+        _diffuseParticles[slot] = d;
+    }
+}
+
+// Advection: one thread per pool slot. Classifies by local fluid density, then
+// integrates as spray (ballistic + air drag), foam (rides the fluid) or bubble
+// (buoyant), ages the marker, and deactivates it when its lifetime runs out.
+[numthreads(256,1,1)]
+void DiffuseAdvect(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= maxDiffuse) return;
+    DiffuseParticle d = _diffuseParticles[id.x];
+    if (d.type < 0 || d.lifetime <= 0.0) return; // inactive slot
+
+    int3 cell = GetCell(d.position);
+    float rho = 0.0;
+    float3 vsum = float3(0, 0, 0);
+    float wsum = 0.0;
+
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                uint end   = _cellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+                for (uint t = start; t < end; ++t)
+                {
+                    float3 diff = d.position - _sortedParticles[t].position;
+                    float r2 = dot(diff, diff);
+                    if (r2 < h2)
+                    {
+                        float w = Wpoly6(r2);
+                        rho  += particleMass * w;
+                        vsum += _sortedParticles[t].velocity * w;
+                        wsum += w;
+                    }
+                }
+            }
+        }
+    }
+
+    float3 vf = (wsum > 1e-6) ? (vsum / wsum) : d.velocity;
+    float dt = _diffuseDt;
+
+    int type;
+    if (rho < diffuseSprayThreshold * restDensity)      type = 0; // spray
+    else if (rho > diffuseBubbleThreshold * restDensity) type = 2; // bubble
+    else                                                 type = 1; // foam
+
+    if (type == 0)
+    {
+        d.velocity += float3(0, -9.81, 0) * dt;
+        if (enableAirDrag == 1)
+        {
+            float3 vrel = d.velocity - windVelocity;
+            d.velocity = windVelocity + vrel * exp(-airDragCoeff * dt);
+        }
+        d.position += d.velocity * dt;
+    }
+    else if (type == 2)
+    {
+        d.velocity += float3(0, diffuseBuoyancy * 9.81, 0) * dt;
+        d.velocity += (vf - d.velocity) * saturate(diffuseDrag * dt);
+        d.position += d.velocity * dt;
+    }
+    else
+    {
+        d.velocity = vf;
+        d.position += vf * dt;
+    }
+
+    d.lifetime -= dt;
+    d.type = (d.lifetime > 0.0) ? type : -1;
+
+    float3 halfB = boxSize * 0.5;
+    d.position = clamp(d.position, -halfB + particleRadius, halfB - particleRadius);
+
+    _diffuseParticles[id.x] = d;
 }

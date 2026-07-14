@@ -14,6 +14,18 @@ public struct Particle
     public Vector3 position;
 }
 
+// Diffuse marker particle (Ihmsen 2012: unified spray/foam/bubbles). Cheap, advected
+// ballistically or with the fluid depending on how much water surrounds it. type:
+// -1 inactive, 0 spray (in air), 1 foam (at surface), 2 bubble (submerged).
+[StructLayout(LayoutKind.Sequential, Size = 32)]
+public struct DiffuseParticle
+{
+    public Vector3 position;
+    public Vector3 velocity;
+    public float lifetime;
+    public int type;
+}
+
 public class SPH : MonoBehaviour
 {
     [Header("General")]
@@ -89,6 +101,43 @@ public class SPH : MonoBehaviour
     [Range(0.5f, 1.0f)]
     public float airDragSurfaceThreshold = 0.9f;
 
+    [Header("Diffuse Particles (Foam / Spray / Bubbles)")]
+    [Tooltip("Ihmsen-2012 diffuse markers spawned where the fluid is aerated. Off by default.")]
+    public bool enableDiffuse = false;
+    [Tooltip("Size of the diffuse pool (ring buffer). Memory + draw cost scale with this.")]
+    public int maxDiffuse = 40000;
+    [Tooltip("White foam material. Auto-created from the Instanced/DiffuseParticle shader if left empty.")]
+    public Material diffuseMaterial;
+    [Tooltip("Render size of foam specks (x particleRadius).")]
+    public float diffuseRenderSize = 3f;
+    [Header("Diffuse — generation")]
+    [Tooltip("Overall spawn-rate multiplier. 0 = none.")]
+    public float diffuseGenRate = 0.6f;
+    [Tooltip("Speed (m/s) mapped to 0..1 kinetic potential: below min spawns nothing, above max is full.")]
+    public float diffuseKEmin = 2f;
+    public float diffuseKEmax = 12f;
+    [Tooltip("Weight of the trapped-air term (fluid crashing/shearing into itself).")]
+    public float diffuseTrappedAir = 1.0f;
+    [Tooltip("Weight of the wave-crest term (surface moving outward along its normal).")]
+    public float diffuseWaveCrest = 1.0f;
+    [Range(0, 16)]
+    [Tooltip("Max diffuse particles a single fluid particle can spawn per frame.")]
+    public int diffuseMaxSpawnPerParticle = 4;
+    [Header("Diffuse — dynamics")]
+    [Tooltip("Lifetime range (seconds) assigned on spawn.")]
+    public float diffuseLifetimeMin = 2f;
+    public float diffuseLifetimeMax = 6f;
+    [Range(0f, 1f)]
+    [Tooltip("Local density (fraction of rho0) below which a marker is spray (ballistic in air).")]
+    public float diffuseSprayThreshold = 0.2f;
+    [Range(0f, 1f)]
+    [Tooltip("Local density (fraction of rho0) above which a marker is a submerged bubble (rises).")]
+    public float diffuseBubbleThreshold = 0.8f;
+    [Tooltip("Bubble buoyancy as a fraction of gravity (upward).")]
+    public float diffuseBuoyancy = 0.8f;
+    [Tooltip("How strongly foam/bubbles are pulled toward the local fluid velocity.")]
+    public float diffuseDrag = 8f;
+
     [Header("Auto spacing")]
     public bool autoMassFromRadius = true;  // mass = rho0 * spacing^3
     public bool clampSupportRadius = true;  // keep h ~ 2x spacing
@@ -119,6 +168,16 @@ public class SPH : MonoBehaviour
     private ComputeBuffer _predPos;    // PCISPH predicted position (sorted-slot)
     private ComputeBuffer _predVel;    // PCISPH predicted velocity (sorted-slot)
     private ComputeBuffer _predAccel;  // PCISPH pressure acceleration scratch (sorted-slot)
+
+    // Diffuse particles (foam/spray/bubbles)
+    private ComputeBuffer _diffuseBuffer;   // fixed pool, ring-buffer allocation
+    private ComputeBuffer _diffuseCount;    // 1 uint: monotonic ring head
+    private ComputeBuffer _diffuseArgsBuffer;
+    private int _diffuseGenerateKernel;
+    private int _diffuseAdvectKernel;
+    private int _actualMaxDiffuse;
+    private bool _diffuseReady;
+    private int _diffuseFrame;
 
     // Kernel IDs
     private int integrateKernel;
@@ -199,6 +258,66 @@ public class SPH : MonoBehaviour
 
         SpawnParticleInBox();
         SetupComputeBuffers();
+        SetupDiffuse();
+    }
+
+    // Diffuse particle pool + kernels + render material. Independent of the fluid buffers so it
+    // can be toggled on/off without touching the verified solver path.
+    private void SetupDiffuse()
+    {
+        // Non-fatal: if the diffuse kernels aren't in the compiled shader (e.g. a compile error),
+        // skip the whole subsystem rather than throwing in Awake and taking down the fluid sim.
+        if (!shader.HasKernel("DiffuseGenerate") || !shader.HasKernel("DiffuseAdvect"))
+        {
+            Debug.LogWarning("[SPH] Diffuse kernels not found in SPHCompute; foam/spray disabled this session.");
+            return;
+        }
+
+        _actualMaxDiffuse = Mathf.Max(256, maxDiffuse);
+
+        _diffuseGenerateKernel = shader.FindKernel("DiffuseGenerate");
+        _diffuseAdvectKernel = shader.FindKernel("DiffuseAdvect");
+
+        _diffuseBuffer = new ComputeBuffer(_actualMaxDiffuse, 32);
+        DiffuseParticle[] init = new DiffuseParticle[_actualMaxDiffuse];
+        for (int i = 0; i < _actualMaxDiffuse; i++) init[i].type = -1; // all inactive
+        _diffuseBuffer.SetData(init);
+
+        _diffuseCount = new ComputeBuffer(1, sizeof(uint));
+        _diffuseCount.SetData(new uint[] { 0 });
+
+        uint[] dargs = {
+            particleMesh.GetIndexCount(0),
+            (uint)_actualMaxDiffuse,
+            particleMesh.GetIndexStart(0),
+            particleMesh.GetBaseVertex(0),
+            0
+        };
+        _diffuseArgsBuffer = new ComputeBuffer(1, dargs.Length * sizeof(uint), ComputeBufferType.IndirectArguments);
+        _diffuseArgsBuffer.SetData(dargs);
+
+        // Both diffuse kernels read the fluid grid (sorted particles + cell ranges); generation
+        // also reads the surface normals. Bind the same fluid buffers used by the SPH passes.
+        int[] diffuseKernels = { _diffuseGenerateKernel, _diffuseAdvectKernel };
+        foreach (int k in diffuseKernels)
+        {
+            shader.SetBuffer(k, "_sortedParticles", _sortedParticlesBuffer);
+            shader.SetBuffer(k, "_cellStarts", _cellStarts);
+            shader.SetBuffer(k, "_cellEnds", _cellEnds);
+            shader.SetBuffer(k, "_particleNormals", _particleNormalsBuffer);
+            shader.SetBuffer(k, "_diffuseParticles", _diffuseBuffer);
+            shader.SetBuffer(k, "_diffuseCount", _diffuseCount);
+        }
+
+        if (diffuseMaterial == null)
+        {
+            Shader s = Shader.Find("Instanced/DiffuseParticle");
+            if (s != null) diffuseMaterial = new Material(s);
+            else Debug.LogWarning("[SPH] Instanced/DiffuseParticle shader not found; diffuse particles won't render. " +
+                                  "Assign a diffuseMaterial or ensure DiffuseParticle.shader is imported.");
+        }
+
+        _diffuseReady = true;
     }
 
     // Clamp one axis of the spawn min-corner so the whole lattice stays inside the box
@@ -454,6 +573,25 @@ public class SPH : MonoBehaviour
         shader.SetFloat("airDragSurfaceThreshold", airDragSurfaceThreshold);
     }
 
+    // Live-tunable diffuse-particle knobs, uploaded when the system is active.
+    private void UploadDiffuseTunables(float dt)
+    {
+        shader.SetInt("maxDiffuse", _actualMaxDiffuse);
+        shader.SetFloat("_diffuseDt", dt);
+        shader.SetFloat("diffuseGenRate", diffuseGenRate);
+        shader.SetFloat("diffuseKEmin", diffuseKEmin);
+        shader.SetFloat("diffuseKEmax", diffuseKEmax);
+        shader.SetFloat("diffuseTrappedAir", diffuseTrappedAir);
+        shader.SetFloat("diffuseWaveCrest", diffuseWaveCrest);
+        shader.SetInt("diffuseMaxSpawnPerParticle", diffuseMaxSpawnPerParticle);
+        shader.SetFloat("diffuseLifetimeMin", diffuseLifetimeMin);
+        shader.SetFloat("diffuseLifetimeMax", diffuseLifetimeMax);
+        shader.SetFloat("diffuseSprayThreshold", diffuseSprayThreshold);
+        shader.SetFloat("diffuseBubbleThreshold", diffuseBubbleThreshold);
+        shader.SetFloat("diffuseBuoyancy", diffuseBuoyancy);
+        shader.SetFloat("diffuseDrag", diffuseDrag);
+    }
+
     // Uploads all h/mass dependent kernel coefficients.
     private void UploadKernelConstants(float h, float mass)
     {
@@ -591,7 +729,8 @@ public class SPH : MonoBehaviour
             {
                 // Non-pressure forces + iterative pressure projection.
                 shader.Dispatch(pciDensityKernel, groupsPhysics, 1, 1);
-                if (enableSurfaceTension)
+                // Normals feed surface tension and the diffuse wave-crest term; compute for either.
+                if (enableSurfaceTension || enableDiffuse)
                     shader.Dispatch(computeNormalsKernel, groupsPhysics, 1, 1);
                 shader.Dispatch(pciNonPressureKernel, groupsPhysics, 1, 1);
                 shader.Dispatch(pciPredictKernel, groupsPhysics, 1, 1);
@@ -627,6 +766,19 @@ public class SPH : MonoBehaviour
 
             // 6. Integrate (reads sorted, writes master) — shared by both solvers
             shader.Dispatch(integrateKernel, groupsPhysics, 1, 1);
+        }
+
+        // Diffuse particles: once per FixedUpdate, reusing the last substep's grid (still bound).
+        // Advect/age the existing pool first, then spawn new markers from the current fluid state.
+        if (enableDiffuse && _diffuseReady)
+        {
+            UploadDiffuseTunables(timeStep);
+            // Monotonic per-dispatch seed: Time.frameCount would repeat when multiple
+            // FixedUpdates run in one render frame, biasing spawn offsets.
+            shader.SetInt("_diffuseSeed", ++_diffuseFrame);
+            int groupsDiffuse = Mathf.CeilToInt((float)_actualMaxDiffuse / THREADS);
+            shader.Dispatch(_diffuseAdvectKernel, groupsDiffuse, 1, 1);
+            shader.Dispatch(_diffuseGenerateKernel, groupsPhysics, 1, 1);
         }
 
         if (logDiagnostics && (++_logCounter % logInterval == 0))
@@ -685,6 +837,7 @@ public class SPH : MonoBehaviour
 
     private static readonly int SizeProperty = Shader.PropertyToID("_size");
     private static readonly int ParticlesBufferProperty = Shader.PropertyToID("_particlesBuffer");
+    private static readonly int DiffuseBufferProperty = Shader.PropertyToID("_diffuseBuffer");
 
     private void Update()
     {
@@ -700,6 +853,20 @@ public class SPH : MonoBehaviour
                 material,
                 new Bounds(spawnCenter, boxSize),
                 _argsBuffer,
+                castShadows: UnityEngine.Rendering.ShadowCastingMode.Off);
+        }
+
+        // Diffuse foam/spray/bubbles. Inactive slots collapse to zero size in the shader.
+        if (enableDiffuse && _diffuseReady && diffuseMaterial != null)
+        {
+            diffuseMaterial.SetFloat(SizeProperty, diffuseRenderSize * particleRadius);
+            diffuseMaterial.SetBuffer(DiffuseBufferProperty, _diffuseBuffer);
+            Graphics.DrawMeshInstancedIndirect(
+                particleMesh,
+                0,
+                diffuseMaterial,
+                new Bounds(spawnCenter, boxSize),
+                _diffuseArgsBuffer,
                 castShadows: UnityEngine.Rendering.ShadowCastingMode.Off);
         }
     }
@@ -719,5 +886,8 @@ public class SPH : MonoBehaviour
         _predPos?.Release();
         _predVel?.Release();
         _predAccel?.Release();
+        _diffuseBuffer?.Release();
+        _diffuseCount?.Release();
+        _diffuseArgsBuffer?.Release();
     }
 }

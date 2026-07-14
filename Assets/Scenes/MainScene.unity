@@ -203,10 +203,26 @@ MonoBehaviour:
   windVelocity: {x: 0, y: 0, z: 0}
   airDragSurfaceOnly: 1
   airDragSurfaceThreshold: 0.9
+  enableDiffuse: 1
+  maxDiffuse: 40000
+  diffuseMaterial: {fileID: 0}
+  diffuseRenderSize: 3
+  diffuseGenRate: 0.6
+  diffuseKEmin: 2
+  diffuseKEmax: 12
+  diffuseTrappedAir: 1
+  diffuseWaveCrest: 1
+  diffuseMaxSpawnPerParticle: 4
+  diffuseLifetimeMin: 2
+  diffuseLifetimeMax: 6
+  diffuseSprayThreshold: 0.2
+  diffuseBubbleThreshold: 0.8
+  diffuseBuoyancy: 0.8
+  diffuseDrag: 8
   autoMassFromRadius: 1
   clampSupportRadius: 1
   substeps: 4
-  logDiagnostics: 1
+  logDiagnostics: 0
   logInterval: 60
 --- !u!114 &553318311
 MonoBehaviour:
