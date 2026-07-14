@@ -176,6 +176,12 @@ MonoBehaviour:
   particleMesh: {fileID: 2540817853737639666, guid: d2bcb9b63a067d643b56910fd449b51b, type: 3}
   particleRenderSize: 8
   material: {fileID: 2100000, guid: ea5407f7bde59d6498a95296ae104fd0, type: 2}
+  particleColorMode: 1
+  speedColorMin: 0
+  speedColorMax: 6
+  densityColorMinFrac: 0.9
+  densityColorMaxFrac: 1.1
+  colorEmission: 0.3
   shader: {fileID: 7200000, guid: 24c53b183693d42c1bced2db06b0dd3d, type: 3}
   particles: []
   solverMode: 0
