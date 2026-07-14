@@ -47,12 +47,16 @@ public class SPH : MonoBehaviour
     public enum ColorMode { Uniform, Speed, Density }
     [Tooltip("Uniform = flat color; Speed = blue->red by velocity magnitude (Seb Lague style); Density = by fluid density.")]
     public ColorMode particleColorMode = ColorMode.Speed;
-    [Tooltip("Value mapped to the blue end of the ramp. Speed: ~0. Density: ~0.9*restingDensity.")]
-    public float colorMin = 0f;
-    [Tooltip("Value mapped to the red end of the ramp. Speed: ~6 m/s. Density: ~1.1*restingDensity.")]
-    public float colorMax = 6f;
+    [Tooltip("Speed (m/s) at the blue end of the ramp (Speed mode).")]
+    public float speedColorMin = 0f;
+    [Tooltip("Speed (m/s) at the red end of the ramp (Speed mode).")]
+    public float speedColorMax = 6f;
+    [Tooltip("Density at the blue end, as a fraction of restingDensity (Density mode). Auto-scales with rho0.")]
+    public float densityColorMinFrac = 0.9f;
+    [Tooltip("Density at the red end, as a fraction of restingDensity (Density mode). Auto-scales with rho0.")]
+    public float densityColorMaxFrac = 1.1f;
     [Range(0f, 2f)]
-    [Tooltip("Emission strength so the colors glow (0 = lit only).")]
+    [Tooltip("Emission strength so the colors glow (0 = lit only). Applied only in Speed/Density modes.")]
     public float colorEmission = 0.3f;
 
     [Header("Compute")]
@@ -860,11 +864,21 @@ public class SPH : MonoBehaviour
         material.SetFloat(SizeProperty, particleRenderSize);
         material.SetBuffer(ParticlesBufferProperty, _particlesBuffer);
 
-        // Live particle coloring (uniform / speed / density gradient).
+        // Live particle coloring (uniform / speed / density gradient). Each mode keeps its own
+        // range; the density range is a fraction of rho0 so it adapts to any restingDensity.
         material.SetFloat(ColorModeProperty, (float)(int)particleColorMode);
-        material.SetFloat(ColorMinProperty, colorMin);
-        material.SetFloat(ColorMaxProperty, colorMax);
-        material.SetFloat(EmissionProperty, colorEmission);
+        if (particleColorMode == ColorMode.Density)
+        {
+            material.SetFloat(ColorMinProperty, densityColorMinFrac * restingDensity);
+            material.SetFloat(ColorMaxProperty, densityColorMaxFrac * restingDensity);
+        }
+        else
+        {
+            material.SetFloat(ColorMinProperty, speedColorMin);
+            material.SetFloat(ColorMaxProperty, speedColorMax);
+        }
+        // Emission only in the gradient modes so Uniform keeps the original flat look (fix #2).
+        material.SetFloat(EmissionProperty, particleColorMode == ColorMode.Uniform ? 0f : colorEmission);
 
         if (showSpheres)
         {
