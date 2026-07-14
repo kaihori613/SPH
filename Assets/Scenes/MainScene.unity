@@ -230,7 +230,7 @@ MonoBehaviour:
   diffuseDrag: 8
   autoMassFromRadius: 1
   clampSupportRadius: 1
-  substeps: 4
+  substeps: 1
   logDiagnostics: 0
   logInterval: 60
 --- !u!114 &553318311
