@@ -339,6 +339,17 @@ public class SPH : MonoBehaviour
         // walls are only built at Awake.
         if (!enableBoundaryParticles || _gridCellCount <= 0) { BindBoundaryDummies(); return; }
 
+        // The boundary loops live in ComputeDensityPressure and ComputeForces only, so PCISPH never
+        // reads them. Building the walls would be pure waste, and staying silent would let PCISPH
+        // look like it was using Akinci walls when it is still on the analytic clamp.
+        if (solverMode == SolverMode.PCISPH)
+        {
+            Debug.LogWarning("[SPH] Boundary particles are wired into the WCSPH kernels only; PCISPH ignores them. " +
+                             "Walls fall back to the analytic clamp. Switch Solver Mode to WCSPH to use them.");
+            BindBoundaryDummies();
+            return;
+        }
+
         float spacing = 2f * particleRadius;
         float hTarget = 2.0f * spacing;
         float hValue = supportRadius > 0f ? supportRadius : hTarget;
