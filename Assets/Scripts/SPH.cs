@@ -322,7 +322,9 @@ public class SPH : MonoBehaviour
         _boundaryCellEnds = new ComputeBuffer(1, sizeof(uint));
         _boundaryCellStarts.SetData(new uint[] { 0xffffffffu });
         _boundaryCellEnds.SetData(new uint[] { 0xffffffffu });
-        foreach (int k in new[] { densityPressureKernel, computeForceKernel })
+        foreach (int k in new[] { densityPressureKernel, computeForceKernel,
+                                  pciDensityKernel, pciPressureUpdateKernel,
+                                  pciPressureAccelKernel, pciPressureForceKernel })
         {
             shader.SetBuffer(k, "_boundaryPositions", _boundaryPositions);
             shader.SetBuffer(k, "_boundaryPsi", _boundaryPsi);
@@ -339,17 +341,8 @@ public class SPH : MonoBehaviour
         // walls are only built at Awake.
         if (!enableBoundaryParticles || _gridCellCount <= 0) { BindBoundaryDummies(); return; }
 
-        // The boundary loops live in ComputeDensityPressure and ComputeForces only, so PCISPH never
-        // reads them. Building the walls would be pure waste, and staying silent would let PCISPH
-        // look like it was using Akinci walls when it is still on the analytic clamp.
-        if (solverMode == SolverMode.PCISPH)
-        {
-            Debug.LogWarning("[SPH] Boundary particles are wired into the WCSPH kernels only; PCISPH ignores them. " +
-                             "Walls fall back to the analytic clamp. Switch Solver Mode to WCSPH to use them.");
-            BindBoundaryDummies();
-            return;
-        }
-
+        // Wired into both solver paths: the WCSPH density/force kernels and the PCISPH
+        // density/pressure-update/accel/force kernels all read these buffers.
         float spacing = 2f * particleRadius;
         float hTarget = 2.0f * spacing;
         float hValue = supportRadius > 0f ? supportRadius : hTarget;
@@ -456,7 +449,7 @@ public class SPH : MonoBehaviour
             if (cellNow != cellNext) ends[cellNow] = (uint)(i + 1);
         }
 
-        // 4. Upload + bind to the WCSPH density and force kernels.
+        // 4. Upload + bind to the WCSPH and PCISPH density/pressure kernels.
         _boundaryPositions = new ComputeBuffer(_boundaryCount, sizeof(float) * 3);
         _boundaryPsi = new ComputeBuffer(_boundaryCount, sizeof(float));
         _boundaryCellStarts = new ComputeBuffer(_gridCellCount, sizeof(uint));
@@ -466,7 +459,9 @@ public class SPH : MonoBehaviour
         _boundaryCellStarts.SetData(starts);
         _boundaryCellEnds.SetData(ends);
 
-        foreach (int k in new[] { densityPressureKernel, computeForceKernel })
+        foreach (int k in new[] { densityPressureKernel, computeForceKernel,
+                                  pciDensityKernel, pciPressureUpdateKernel,
+                                  pciPressureAccelKernel, pciPressureForceKernel })
         {
             shader.SetBuffer(k, "_boundaryPositions", _boundaryPositions);
             shader.SetBuffer(k, "_boundaryPsi", _boundaryPsi);

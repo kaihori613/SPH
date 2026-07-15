@@ -248,6 +248,63 @@ float3 gradSpiky(float3 rij, float dist)
     return grad;
 }
 
+// --- Akinci boundary helpers ------------------------------------------------------------
+// The boundary grid is indexed over the SAME cells as the fluid grid, so callers walk the
+// 27-cell stencil around `cell` (from the CURRENT position) and evaluate the kernel at
+// `origin` (current for WCSPH, predicted for PCISPH). Psi already bakes in rho0 * volume.
+
+// Akinci density contribution: sum_b Psi_b W(origin - x_b).
+float BoundaryDensitySum(float3 origin, int3 cell)
+{
+    float rho = 0.0;
+    for (int bi = -1; bi <= 1; bi++){
+        for (int bj = -1; bj <= 1; bj++){
+            for (int bk = -1; bk <= 1; bk++){
+                int3 n = cell + int3(bi, bj, bk);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+                uint cIdx = CellLinear(n);
+                uint start = _boundaryCellStarts[cIdx];
+                uint end   = _boundaryCellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+                for (uint t = start; t < end; ++t)
+                {
+                    float3 diff = origin - _boundaryPositions[t];
+                    float r2 = dot(diff, diff);
+                    if (r2 < h2) rho += _boundaryPsi[t] * Wpoly6(r2);
+                }
+            }
+        }
+    }
+    return rho;
+}
+
+// Geometric part of the one-sided Akinci pressure term: sum_b (-Psi_b) gradW(origin - x_b).
+// Callers scale by p_i/rho_i^2 (acceleration) or m_i * p_i/rho_i^2 (force, mass^2 convention).
+float3 BoundaryPressureGradSum(float3 origin, int3 cell)
+{
+    float3 s = float3(0, 0, 0);
+    for (int bi = -1; bi <= 1; bi++){
+        for (int bj = -1; bj <= 1; bj++){
+            for (int bk = -1; bk <= 1; bk++){
+                int3 n = cell + int3(bi, bj, bk);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+                uint cIdx = CellLinear(n);
+                uint start = _boundaryCellStarts[cIdx];
+                uint end   = _boundaryCellEnds[cIdx];
+                if (start == 0xffffffffu) continue;
+                for (uint t = start; t < end; ++t)
+                {
+                    float3 diff = origin - _boundaryPositions[t];
+                    float dist = length(diff);
+                    if (dist > 1e-6 && dist < h)
+                        s += -_boundaryPsi[t] * gradSpiky(diff, dist);
+                }
+            }
+        }
+    }
+    return s;
+}
+
 float ViscosityKernelSecondDerivative(float r)
 {
     float t = hr(r);
@@ -659,6 +716,7 @@ void PCIComputeDensity(uint3 id : SV_DispatchThreadID)
             }
         }
     }
+    if (enableBoundary == 1) rho += BoundaryDensitySum(pos, cell);
     _sortedParticles[id.x].density = max(rho, 1e-6);
 }
 
@@ -778,6 +836,7 @@ void PCIPressureUpdate(uint3 id : SV_DispatchThreadID)
             }
         }
     }
+    if (enableBoundary == 1) rho += BoundaryDensitySum(origin, cell);
 
     _sortedParticles[id.x].density = max(rho, 1e-6);
     float err = rho - restDensity;
@@ -821,6 +880,8 @@ void PCIPressureAccel(uint3 id : SV_DispatchThreadID)
             }
         }
     }
+    // Akinci wall push: one-sided, using only the fluid particle's own pressure (mirror).
+    if (enableBoundary == 1) a_p += pi_term * BoundaryPressureGradSum(origin, cell);
     _predAccel[id.x] = a_p;
 }
 
@@ -874,6 +935,8 @@ void PCIComputePressureForce(uint3 id : SV_DispatchThreadID)
             }
         }
     }
+    // Akinci wall push (force form, mass^2 convention): m_i * (p_i/rho_i^2) * sum_b -Psi_b gradW.
+    if (enableBoundary == 1) F_pressure += particleMass * pi_term * BoundaryPressureGradSum(origin, cell);
     _sortedParticles[id.x].currentForce += F_pressure;
 }
 
