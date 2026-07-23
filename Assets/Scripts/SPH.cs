@@ -319,6 +319,22 @@ public class SPH : MonoBehaviour
         return BoundaryCellLinear(cx, cy, cz);
     }
 
+    // Initial lattice spacing = 2r. Single source of truth.
+    private float ParticleSpacing => 2f * particleRadius;
+
+    // SPH support radius (smoothing length h). MUST be the single source of truth: the fluid
+    // grid resolution (SetupComputeBuffers), the boundary cell assignment (SetupBoundary), and
+    // the per-frame kernel upload (FixedUpdate) all derive their cell geometry from this. If any
+    // of them computed h differently, boundary particles would be bucketed into different cells
+    // than _gridRes indexes and the Akinci wall lookups would silently read the wrong cells.
+    private float ComputeSupportRadius()
+    {
+        float spacing = ParticleSpacing;
+        float h = supportRadius > 0f ? supportRadius : 2.0f * spacing;
+        if (clampSupportRadius) h = Mathf.Clamp(h, 1.8f * spacing, 2.4f * spacing);
+        return h;
+    }
+
     // Samples the 6 box faces, computes each particle's Akinci Psi (rho0 * volume) from its
     // boundary neighbours, sorts them into the fluid grid, and uploads. Built once at startup
     // because the walls are static. Independent of the fluid buffers.
@@ -353,10 +369,8 @@ public class SPH : MonoBehaviour
 
         // Wired into both solver paths: the WCSPH density/force kernels and the PCISPH
         // density/pressure-update/accel/force kernels all read these buffers.
-        float spacing = 2f * particleRadius;
-        float hTarget = 2.0f * spacing;
-        float hValue = supportRadius > 0f ? supportRadius : hTarget;
-        if (clampSupportRadius) hValue = Mathf.Clamp(hValue, 1.8f * spacing, 2.4f * spacing);
+        float spacing = ParticleSpacing;
+        float hValue = ComputeSupportRadius();
         float invH = 1f / hValue;
         float h2 = hValue * hValue;
         float poly6C = 315f / (64f * Mathf.PI * Mathf.Pow(hValue, 9f));
@@ -558,7 +572,7 @@ public class SPH : MonoBehaviour
 
         // Keep the spawn lattice fully inside the box. Spawning even partly outside makes the
         // frame-1 wall clamp pile particles onto a wall plane -> overlap -> pressure explosion.
-        float spacing = 2f * particleRadius;
+        float spacing = ParticleSpacing;
         Vector3 extent = new Vector3((numToSpawn.x - 1) * spacing,
                                      (numToSpawn.y - 1) * spacing,
                                      (numToSpawn.z - 1) * spacing);
@@ -670,10 +684,7 @@ public class SPH : MonoBehaviour
         pciPressureForceKernel = shader.FindKernel("PCIComputePressureForce");
 
         // 4. Support radius + grid resolution
-        float s = 2f * particleRadius;
-        float hTarget = 2.0f * s;
-        float hValue = supportRadius > 0f ? supportRadius : hTarget;
-        if (clampSupportRadius) hValue = Mathf.Clamp(hValue, 1.8f * s, 2.4f * s);
+        float hValue = ComputeSupportRadius();
 
         int rx = Mathf.Max(1, Mathf.CeilToInt(boxSize.x / hValue));
         int ry = Mathf.Max(1, Mathf.CeilToInt(boxSize.y / hValue));
@@ -854,7 +865,7 @@ public class SPH : MonoBehaviour
     // (regular lattice at particle spacing). delta = -1 / (beta * (-|sum gradW|^2 - sum(gradW.gradW))).
     private float ComputePCISPHDelta(float h, float mass, float dt)
     {
-        float spacing = 2f * particleRadius;
+        float spacing = ParticleSpacing;
         float h6 = Mathf.Pow(h, 6f);
         Vector3 sumGrad = Vector3.zero;
         float sumGradDot = 0f;
@@ -899,10 +910,8 @@ public class SPH : MonoBehaviour
         int groupsCells = Mathf.CeilToInt((float)_gridCellCount / THREADS);
 
         // Dynamic parameters
-        float spacing = 2f * particleRadius;
-        float hTarget = 2.0f * spacing;
-        float hValue = supportRadius > 0f ? supportRadius : hTarget;
-        if (clampSupportRadius) hValue = Mathf.Clamp(hValue, 1.8f * spacing, 2.4f * spacing);
+        float spacing = ParticleSpacing;
+        float hValue = ComputeSupportRadius();
 
         float mass = autoMassFromRadius ? restingDensity * spacing * spacing * spacing : particleMass;
 
