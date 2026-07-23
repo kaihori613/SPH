@@ -27,6 +27,13 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
     [Tooltip("Kernel half-width in depth-buffer texels. Cost is O((2r+1)^2) taps per pixel, so " +
              "keep it modest — 4-6 is usually enough. Larger = smoother but washes out detail.")]
     public int depthBlurRadius = 5;
+    [Range(1, 4)]
+    [Tooltip("Subsample the blur kernel every N texels. 1 = full quality (every texel), 2 = " +
+             "~4x fewer taps for a wider kernel at the same radius. The per-tap gaussian uses " +
+             "the true offset, so the kernel width is preserved; higher strides trade a little " +
+             "smoothness for speed. This is the cheap in-pass cost lever until a proper " +
+             "separable (2x1D) blur lands.")]
+    public int depthBlurStride = 2;
     [Tooltip("Spatial falloff in texels.")]
     public float depthSigmaSpatial = 4f;
     [Tooltip("Depth-difference tolerance in WORLD units. Around a particle radius or two: big " +
@@ -168,6 +175,7 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
         // collapsing the front-depth RT to background on Metal inside OnRenderImage; folding it
         // into the composite needs no extra render targets and can't hit that ordering bug.
         compositeMat.SetInt  ("_SmoothRadius", smoothDepth ? depthBlurRadius : 0);
+        compositeMat.SetInt  ("_SmoothStride", Mathf.Max(1, depthBlurStride));
         compositeMat.SetFloat("_SmoothSigmaS", depthSigmaSpatial);
         compositeMat.SetFloat("_SmoothSigmaR", depthSigmaRange);
 

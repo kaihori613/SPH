@@ -9,6 +9,7 @@ Shader "Fluid/Composite"
         _SpecPower("Sun specular power", Float) = 150
         _SpecIntensity("Sun specular intensity", Float) = 1.0
         _SmoothRadius("Depth smooth radius (texels)", Int) = 5
+        _SmoothStride("Depth smooth sample stride (texels)", Int) = 2
         _SmoothSigmaS("Depth smooth spatial sigma", Float) = 4.0
         _SmoothSigmaR("Depth smooth range sigma (world)", Float) = 0.4
     }
@@ -39,6 +40,7 @@ Shader "Fluid/Composite"
             float3 _SunColor;   // sun color * intensity
 
             int   _SmoothRadius;
+            int   _SmoothStride;
             float _SmoothSigmaS, _SmoothSigmaR;
 
             float3 ReconstructViewPos(float2 uv, float zView)
@@ -54,9 +56,17 @@ Shader "Fluid/Composite"
             // to background on Metal inside OnRenderImage. Derives normals from the smoothed
             // depth (Green GDC10), which is what turns per-particle bumps into a surface.
             // Background sentinel (-1e20) neighbours are excluded so edges stay sharp.
+            //
+            // Cost: a full 2D kernel is (2R+1)^2 taps/px (441 at R=10) and was measured at
+            // ~23 ms. _SmoothStride subsamples the kernel every N texels — R=10, stride=2 is
+            // 11x11=121 taps (~3.6x fewer) — while keeping the true gaussian weight at each
+            // tap's real offset, so the effective kernel width is preserved. This is the safe,
+            // in-pass cost cut; a proper separable (2x1D) blur is the bigger win but needs the
+            // RT-pass rework that hit the Metal bug above.
             float SmoothFrontDepth(float2 uv, float zc)
             {
                 if (_SmoothRadius <= 0) return zc;
+                int stride = max(1, _SmoothStride);
 
                 float inv2s2 = 0.5 / max(_SmoothSigmaS * _SmoothSigmaS, 1e-8);
                 float inv2r2 = 0.5 / max(_SmoothSigmaR * _SmoothSigmaR, 1e-8);
@@ -65,9 +75,9 @@ Shader "Fluid/Composite"
                 float2 texel = _DepthTex_TexelSize.xy;
 
                 [loop]
-                for (int y = -_SmoothRadius; y <= _SmoothRadius; y++)
+                for (int y = -_SmoothRadius; y <= _SmoothRadius; y += stride)
                 [loop]
-                for (int x = -_SmoothRadius; x <= _SmoothRadius; x++)
+                for (int x = -_SmoothRadius; x <= _SmoothRadius; x += stride)
                 {
                     if (x == 0 && y == 0) continue;
                     float2 o = float2(x, y) * texel;
