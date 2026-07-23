@@ -47,6 +47,8 @@ public class SPH : MonoBehaviour
     public enum ColorMode { Uniform, Speed, Density }
     [Tooltip("Uniform = flat color; Speed = blue->red by velocity magnitude (Seb Lague style); Density = by fluid density.")]
     public ColorMode particleColorMode = ColorMode.Speed;
+    [Tooltip("Master color ON/OFF (live). OFF = plain flat water (no gradient, no glow); ON = color by 'Particle Color Mode' above. Set that mode to Density and toggle this on for the realness/incompressibility check.")]
+    public bool showColor = true;
     [Tooltip("Speed (m/s) at the blue end of the ramp (Speed mode).")]
     public float speedColorMin = 0f;
     [Tooltip("Speed (m/s) at the red end of the ramp (Speed mode).")]
@@ -103,16 +105,24 @@ public class SPH : MonoBehaviour
     public bool enableVorticity = true;
     public float vorticityEps = 0.1f;
 
-    [Header("Air Friction / Wind")]
-    [Tooltip("Air-fluid drag: surface velocity relaxes toward windVelocity as exp(-airDragCoeff*dt). Off by default.")]
+    [Header("Air Friction / Wind (Gissler 2017)")]
+    [Tooltip("Quadratic air drag on air-exposed particles: slows spray/droplets to a terminal velocity and lets wind push the surface. Exposure is auto-detected by occlusion (no density threshold needed). Off by default.")]
     public bool enableAirDrag = false;
-    [Tooltip("Drag rate k (1/s). ~0.5 = gentle air resistance, ~5 = strong. Stable at any value (implicit).")]
-    public float airDragCoeff = 1.0f;
+    [Tooltip("Air density rho_air in the drag equation. Higher = stronger air resistance / lower spray terminal velocity.")]
+    public float airDensity = 1.2f;
+    [Tooltip("Drag coefficient Cd (sphere ~0.47). Tune with airDensity for the spray look; effective strength also scales with your density units, so expect to tune this live.")]
+    public float airDragCd = 0.5f;
+    [Tooltip("Droplet deformation per relative-speed^2 (Gissler): fast lone droplets flatten into disks and gain much more drag, so spray forms a tighter cone and doesn't over-shoot. 0 = plain quadratic drag. Raise for a stronger effect.")]
+    public float airDeform = 0.015f;
+    [Tooltip("Approx neighbour count of a fully-packed particle. Blends lone-droplet drag (deforming) vs bulk-surface drag. ~26 for the default h/spacing.")]
+    public float airNFull = 26f;
     [Tooltip("Ambient air velocity. Non-zero = wind that pushes the exposed surface.")]
     public Vector3 windVelocity = Vector3.zero;
-    [Tooltip("Apply drag mainly to exposed free-surface particles (density-based) instead of the whole body. Physically, only the surface touches air.")]
+    [Tooltip("Exponential drag rate k (1/s) for DIFFUSE spray markers only (foam). The fluid uses the quadratic drag above.")]
+    public float airDragCoeff = 1.0f;
+    [Tooltip("(Legacy; unused by the fluid now — occlusion handles surface selection.)")]
     public bool airDragSurfaceOnly = true;
-    [Tooltip("Particles below this fraction of rest density count as surface (full drag); the bulk (rho~=rho0) is shielded.")]
+    [Tooltip("(Legacy; unused by the fluid now.)")]
     [Range(0.5f, 1.0f)]
     public float airDragSurfaceThreshold = 0.9f;
 
@@ -783,6 +793,10 @@ public class SPH : MonoBehaviour
         shader.SetVector("windVelocity", windVelocity);
         shader.SetInt("airDragSurfaceOnly", airDragSurfaceOnly ? 1 : 0);
         shader.SetFloat("airDragSurfaceThreshold", airDragSurfaceThreshold);
+        shader.SetFloat("airDensity", airDensity);
+        shader.SetFloat("airDragCd", airDragCd);
+        shader.SetFloat("airDeform", airDeform);
+        shader.SetFloat("airNFull", airNFull);
 
         shader.SetInt("enableBoundary", (enableBoundaryParticles && _boundaryReady) ? 1 : 0);
     }
@@ -1065,8 +1079,10 @@ public class SPH : MonoBehaviour
 
         // Live particle coloring (uniform / speed / density gradient). Each mode keeps its own
         // range; the density range is a fraction of rho0 so it adapts to any restingDensity.
-        material.SetFloat(ColorModeProperty, (float)(int)particleColorMode);
-        if (particleColorMode == ColorMode.Density)
+        // showColor is the master on/off: OFF -> plain uniform water; ON -> the chosen gradient mode.
+        ColorMode effMode = showColor ? particleColorMode : ColorMode.Uniform;
+        material.SetFloat(ColorModeProperty, (float)(int)effMode);
+        if (effMode == ColorMode.Density)
         {
             material.SetFloat(ColorMinProperty, densityColorMinFrac * restingDensity);
             material.SetFloat(ColorMaxProperty, densityColorMaxFrac * restingDensity);
@@ -1076,8 +1092,8 @@ public class SPH : MonoBehaviour
             material.SetFloat(ColorMinProperty, speedColorMin);
             material.SetFloat(ColorMaxProperty, speedColorMax);
         }
-        // Emission only in the gradient modes so Uniform keeps the original flat look (fix #2).
-        material.SetFloat(EmissionProperty, particleColorMode == ColorMode.Uniform ? 0f : colorEmission);
+        // Emission only in the gradient modes so Uniform keeps the original flat look.
+        material.SetFloat(EmissionProperty, effMode == ColorMode.Uniform ? 0f : colorEmission);
 
         if (showSpheres)
         {
