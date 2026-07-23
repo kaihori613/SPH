@@ -1,127 +1,110 @@
 Shader "Fluid/BilateralBlur"
 {
-    Properties { 
-        _Radius ("Radius (pixels)", Int) = 3
-        _SigmaS ("Sigma Spatial", Float) = 2.5
-        _SigmaR ("Sigma Range (depth)", Float) = 0.02
+    // Passes 0/1 blur an arbitrary texture guided by a separate depth texture (_Guide).
+    // Passes 2/3 blur DEPTH itself, using _MainTex as its own guide — this is the one that
+    // matters for surface quality (Green, "Screen Space Fluid Rendering for Games", GDC 2010):
+    // normals are derived from depth, so depth must be smoothed or the surface reads as
+    // per-particle bumps. Bilateral (not Gaussian) so silhouettes between separate fluid
+    // bodies stay sharp instead of smearing into each other.
+    Properties {
+        _Radius ("Radius (pixels)", Int) = 8
+        _SigmaS ("Sigma Spatial", Float) = 4.0
+        _SigmaR ("Sigma Range (depth)", Float) = 0.5
     }
     SubShader
     {
         Cull Off ZWrite Off ZTest Always
 
-        Pass // 0: Horizontal
+        HLSLINCLUDE
+        #include "UnityCG.cginc"
+        #pragma target 3.0
+
+        sampler2D _MainTex;
+        sampler2D _Guide;
+        float4    _MainTex_TexelSize;   // (1/w, 1/h, w, h)
+
+        int   _Radius;
+        float _SigmaS;
+        float _SigmaR;
+
+        // Bilateral tap loop along `step`. `guideIsSelf` picks whether range weights come from
+        // _MainTex (depth blurring itself) or the separate _Guide texture.
+        float4 BlurAlong(float2 uv, float2 step, bool guideIsSelf)
+        {
+            float zc = guideIsSelf ? tex2D(_MainTex, uv).r : tex2D(_Guide, uv).r;
+
+            // Background: nothing to smooth, and blending with -1e20 would poison neighbours.
+            if (zc <= -1e19) return tex2D(_MainTex, uv);
+
+            float4 acc  = tex2D(_MainTex, uv);
+            float  wsum = 1.0;
+
+            float inv2s2 = 0.5 / max(_SigmaS * _SigmaS, 1e-8);
+            float inv2r2 = 0.5 / max(_SigmaR * _SigmaR, 1e-8);
+
+            [loop]
+            for (int j = 1; j <= _Radius; j++)
+            {
+                float2 o = step * j;
+                float wS = exp(-(j * j) * inv2s2);
+
+                float2 uvA = uv - o;
+                float2 uvB = uv + o;
+
+                float zA = guideIsSelf ? tex2D(_MainTex, uvA).r : tex2D(_Guide, uvA).r;
+                float zB = guideIsSelf ? tex2D(_MainTex, uvB).r : tex2D(_Guide, uvB).r;
+
+                // Background neighbours get zero weight rather than dragging the surface out.
+                float dA = zA - zc, dB = zB - zc;
+                float wA = (zA <= -1e19) ? 0.0 : wS * exp(-dA * dA * inv2r2);
+                float wB = (zB <= -1e19) ? 0.0 : wS * exp(-dB * dB * inv2r2);
+
+                acc  += tex2D(_MainTex, uvA) * wA;
+                acc  += tex2D(_MainTex, uvB) * wB;
+                wsum += wA + wB;
+            }
+
+            return acc / max(wsum, 1e-6);
+        }
+        ENDHLSL
+
+        Pass // 0: horizontal, guided by _Guide
         {
             HLSLPROGRAM
-            #pragma target 3.0
-            #pragma vertex   vert_img
+            #pragma vertex vert_img
             #pragma fragment frag
-            #include "UnityCG.cginc"
-
-            sampler2D _MainTex;              // thickness RT (low-res)
-            sampler2D _Guide;                // front-depth RT (low-res, view-space z)
-            float4    _MainTex_TexelSize;    // (1/w, 1/h, w, h)
-
-            int   _Radius;
-            float _SigmaS;
-            float _SigmaR;
-            
-            float4 frag(v2f_img i) : SV_Target {
-
-                float2 uv = i.uv;
-
-                float zc = tex2D(_Guide, uv).r;
-             
-                if (zc <= -1e19) {
-                    return tex2D(_MainTex, uv);
-                }
-
-                float4 acc   = tex2D(_MainTex, uv);
-                float  wsum  = 1.0;
-
-                float inv2s2 = 0.5 / (_SigmaS * _SigmaS);
-                float inv2r2 = 0.5 / (_SigmaR * _SigmaR);
-
-                float2 step = float2(_MainTex_TexelSize.x, 0);
-
-                [unroll(32)]
-                for (int j = 1; j <= _Radius; j++)
-                {
-                    float2 o  = step * j;
-                    float  zl = tex2D(_Guide, uv - o).r;
-                    float  zr = tex2D(_Guide, uv + o).r;
-
-                    // spatial weights (gaussian over pixel distance)
-                    float wS = exp(- (j*j) * inv2s2);
-
-                    // range weights (gaussian over depth difference)
-                    float wRl = exp(- (zl - zc)*(zl - zc) * inv2r2);
-                    float wRr = exp(- (zr - zc)*(zr - zc) * inv2r2);
-
-                    float wl = wS * wRl;
-                    float wr = wS * wRr;
-
-                    acc  += tex2D(_MainTex, uv - o) * wl;
-                    acc  += tex2D(_MainTex, uv + o) * wr;
-                    wsum += wl + wr;
-                }
-
-                return acc / max(wsum, 1e-6);
-            }
+            float4 frag(v2f_img i) : SV_Target
+            { return BlurAlong(i.uv, float2(_MainTex_TexelSize.x, 0), false); }
             ENDHLSL
         }
 
-        Pass // 1: Vertical
+        Pass // 1: vertical, guided by _Guide
         {
             HLSLPROGRAM
-            #pragma target 3.0
-            #pragma vertex   vert_img
+            #pragma vertex vert_img
             #pragma fragment frag
-            #include "UnityCG.cginc"
+            float4 frag(v2f_img i) : SV_Target
+            { return BlurAlong(i.uv, float2(0, _MainTex_TexelSize.y), false); }
+            ENDHLSL
+        }
 
-            sampler2D _MainTex;
-            sampler2D _Guide;
-            float4    _MainTex_TexelSize;
+        Pass // 2: horizontal DEPTH blur (self-guided)
+        {
+            HLSLPROGRAM
+            #pragma vertex vert_img
+            #pragma fragment frag
+            float4 frag(v2f_img i) : SV_Target
+            { return BlurAlong(i.uv, float2(_MainTex_TexelSize.x, 0), true); }
+            ENDHLSL
+        }
 
-            int   _Radius;
-            float _SigmaS;
-            float _SigmaR;
-
-            float4 frag(v2f_img i) : SV_Target {
-
-                float2 uv = i.uv;
-
-                float zc = tex2D(_Guide, uv).r;
-                if (zc <= -1e19) return tex2D(_MainTex, uv);
-
-                float4 acc   = tex2D(_MainTex, uv);
-                float  wsum  = 1.0;
-
-                float inv2s2 = 0.5 / (_SigmaS * _SigmaS);
-                float inv2r2 = 0.5 / (_SigmaR * _SigmaR);
-
-                float2 step = float2(0, _MainTex_TexelSize.y);
-
-                [unroll(32)]
-                for (int j = 1; j <= _Radius; j++)
-                {
-                    float2 o  = step * j;
-                    float  zd = tex2D(_Guide, uv - o).r;
-                    float  zu = tex2D(_Guide, uv + o).r;
-
-                    float wS = exp(- (j*j) * inv2s2);
-                    float wRd = exp(- (zd - zc)*(zd - zc) * inv2r2);
-                    float wRu = exp(- (zu - zc)*(zu - zc) * inv2r2);
-
-                    float wd = wS * wRd;
-                    float wu = wS * wRu;
-
-                    acc  += tex2D(_MainTex, uv - o) * wd;
-                    acc  += tex2D(_MainTex, uv + o) * wu;
-                    wsum += wd + wu;
-                }
-
-                return acc / max(wsum, 1e-6);
-            }
+        Pass // 3: vertical DEPTH blur (self-guided)
+        {
+            HLSLPROGRAM
+            #pragma vertex vert_img
+            #pragma fragment frag
+            float4 frag(v2f_img i) : SV_Target
+            { return BlurAlong(i.uv, float2(0, _MainTex_TexelSize.y), true); }
             ENDHLSL
         }
     }

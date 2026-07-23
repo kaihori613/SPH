@@ -15,13 +15,30 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
     public Material compositeMat;
 
     [Header("Settings")]
+    [Tooltip("Fluid buffers are rendered at this fraction of screen resolution. 1 = full res (sharpest, most expensive).")]
     [Range(0.25f, 1f)]
-    public float resolutionScale = 0.5f;
+    public float resolutionScale = 1f;
+
+    [Header("Depth smoothing (Green GDC10)")]
+    [Tooltip("Bilateral-smooth the front depth before deriving normals (done in the composite " +
+             "shader). Without this the surface shows one bump per particle. Main quality knob.")]
+    public bool smoothDepth = true;
+    [Range(1, 12)]
+    [Tooltip("Kernel half-width in depth-buffer texels. Cost is O((2r+1)^2) taps per pixel, so " +
+             "keep it modest — 4-6 is usually enough. Larger = smoother but washes out detail.")]
+    public int depthBlurRadius = 5;
+    [Tooltip("Spatial falloff in texels.")]
+    public float depthSigmaSpatial = 4f;
+    [Tooltip("Depth-difference tolerance in WORLD units. Around a particle radius or two: big " +
+             "enough to smooth bumps, small enough that separate surfaces stay separate.")]
+    public float depthSigmaRange = 0.4f;
 
     RenderTexture _rtThickness, _rtThicknessPing;
     RenderTexture _rtDepthFront;    // front depth as COLOR (view-space z)
     RenderTexture _rtMrtDepth;      // dummy 24-bit depth for MRT binding
     Mesh _quadMesh;
+    CommandBuffer _cmd;             // immediate-mode draw into the MRT (see OnRenderImage)
+    ComputeBuffer _argsBuf;         // persistent: the render thread reads it after OnRenderImage returns
 
     [Header("Look")]
     [Range(1.0f, 2.0f)] public float renderRadiusScale = 1.4f;
@@ -35,7 +52,14 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
         if (thicknessMat) thicknessMat.enableInstancing = true; // required for InstancedIndirect
     }
 
-    void OnDisable() => ReleaseRTs();
+    void OnDisable()
+    {
+        ReleaseRTs();
+        _cmd?.Release();
+        _cmd = null;
+        _argsBuf?.Release();
+        _argsBuf = null;
+    }
 
     void ReleaseRTs()
     {
@@ -88,8 +112,14 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
         EnsureRTs(src.width, src.height);
 
         // 1. Thickness + FrontDepth (MRT, half-res)
-        var vp = cam.projectionMatrix * cam.worldToCameraMatrix;
+        // GPU expects the API projection matrix (Metal/D3D convention + render-into-RT flip),
+        // not the raw GL-convention cam.projectionMatrix.
+        var proj = GL.GetGPUProjectionMatrix(cam.projectionMatrix, renderIntoTexture: true);
+        var vp = proj * cam.worldToCameraMatrix;
         thicknessMat.SetMatrix("_VP", vp);
+        // Passed explicitly: the CommandBuffer draw below runs outside the camera's render
+        // loop, so built-ins like UNITY_MATRIX_V are not set up for this camera.
+        thicknessMat.SetMatrix("_View", cam.worldToCameraMatrix);
         thicknessMat.SetVector("_CamRight", cam.transform.right);
         thicknessMat.SetVector("_CamUp",    cam.transform.up);
         thicknessMat.SetFloat ("_ParticleRadius", sph.particleRadius * renderRadiusScale);
@@ -103,10 +133,6 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
         Graphics.SetRenderTarget(_rtDepthFront);
         GL.Clear(false, true, new Color(-1e20f, 0, 0, 0));
 
-        // Bind MRT (thickness, front-depth) with a valid depth buffer
-        var mrt = new RenderBuffer[] { _rtThickness.colorBuffer, _rtDepthFront.colorBuffer };
-        Graphics.SetRenderTarget(mrt, _rtMrtDepth.depthBuffer);
-
         if (!_quadMesh) _quadMesh = MakeUnitQuad();
 
         uint[] args = {
@@ -116,32 +142,48 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
             (uint)_quadMesh.GetBaseVertex(0),
             0
         };
-        
-        using (var argsBuf = new ComputeBuffer(1, sizeof(uint) * 5, ComputeBufferType.IndirectArguments))
-        {
-            argsBuf.SetData(args);
 
-            //var center = sph.transform.TransformPoint(sph.spawnCenter); // center on your fluid volume
-            var center = sph.spawnCenter; 
-            var size = sph.boxSize * 2f;                               // generous bounds to avoid culling
-            var bounds = new Bounds(center, size);
+        // Persistent args buffer: disposing it in the same frame (the old using-block) is a
+        // race — the render thread reads the indirect args after this method returns.
+        if (_argsBuf == null) _argsBuf = new ComputeBuffer(1, sizeof(uint) * 5, ComputeBufferType.IndirectArguments);
+        _argsBuf.SetData(args);
 
-            int drawLayer = sph.gameObject.layer;
+        // Graphics.DrawMeshInstancedIndirect only ENQUEUES the mesh for the camera's next
+        // render loop — inside OnRenderImage it never hits the RT bound here and the
+        // thickness/front-depth targets stay empty. A CommandBuffer executed immediately
+        // is the synchronous path.
+        // Two single-RT draws (not MRT): per-render-target blend state is silently ignored
+        // on Metal here, which broke thickness accumulation. Shader pass 0 = additive
+        // thickness, pass 1 = Max front depth.
+        if (_cmd == null) _cmd = new CommandBuffer { name = "FluidThickness" };
+        _cmd.Clear();
+        _cmd.SetRenderTarget(_rtThickness);
+        _cmd.DrawMeshInstancedIndirect(_quadMesh, 0, thicknessMat, 0, _argsBuf);
+        _cmd.SetRenderTarget(_rtDepthFront);
+        _cmd.DrawMeshInstancedIndirect(_quadMesh, 0, thicknessMat, 1, _argsBuf);
+        Graphics.ExecuteCommandBuffer(_cmd);
 
-            Graphics.DrawMeshInstancedIndirect(_quadMesh, 0, thicknessMat, bounds, argsBuf,
-            0, null, ShadowCastingMode.Off, receiveShadows:false, layer:drawLayer, camera:cam);
-        }
-
-        // 2. Blur Pass (Bilateral Filter)
-        if (blurMat)
-        {
-            blurMat.SetTexture("_Guide", _rtDepthFront);
-            Graphics.Blit(_rtThickness, _rtThicknessPing, blurMat, 0);
-            blurMat.SetTexture("_Guide", _rtDepthFront);
-            Graphics.Blit(_rtThicknessPing, _rtThickness, blurMat, 1);
-        }
+        // 2. Depth smoothing is done INSIDE the composite shader (bilateral tap before normal
+        // reconstruction), not as a separate blur pass. The separable ping-pong approach kept
+        // collapsing the front-depth RT to background on Metal inside OnRenderImage; folding it
+        // into the composite needs no extra render targets and can't hit that ordering bug.
+        compositeMat.SetInt  ("_SmoothRadius", smoothDepth ? depthBlurRadius : 0);
+        compositeMat.SetFloat("_SmoothSigmaS", depthSigmaSpatial);
+        compositeMat.SetFloat("_SmoothSigmaR", depthSigmaRange);
 
         // 4. Composite Pass
+        // Sun for the specular term, in view space (the composite works in view space).
+        var sun = RenderSettings.sun;
+        if (sun)
+        {
+            Vector3 sunDirVS = cam.worldToCameraMatrix.MultiplyVector(-sun.transform.forward);
+            compositeMat.SetVector("_SunDirVS", sunDirVS.normalized);
+            compositeMat.SetColor("_SunColor", sun.color * sun.intensity);
+        }
+        else
+        {
+            compositeMat.SetColor("_SunColor", Color.black); // no sun, no specular
+        }
         compositeMat.SetTexture("_SceneTex", src);
         compositeMat.SetTexture("_DepthTex", _rtDepthFront);
         compositeMat.SetTexture("_ThicknessTex", _rtThickness);

@@ -87,7 +87,12 @@ Material:
     - _OcclusionStrength: 1
     - _Parallax: 0.02
     - _RefractScale: 0.02
+    - _SmoothRadius: 6
+    - _SmoothSigmaR: 0.4
+    - _SmoothSigmaS: 5
     - _SmoothnessTextureChannel: 0
+    - _SpecIntensity: 1
+    - _SpecPower: 150
     - _SpecularHighlights: 1
     - _SrcBlend: 1
     - _UVSec: 0
