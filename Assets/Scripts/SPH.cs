@@ -188,6 +188,7 @@ public class SPH : MonoBehaviour
     public int logInterval = 60;
     private int _logCounter;
     private Particle[] _readback;
+    private float _frameMsEMA; // smoothed frame time for the in-log profiler
 
     // Private variables
     private ComputeBuffer _argsBuffer;
@@ -1052,7 +1053,9 @@ public class SPH : MonoBehaviour
         }
 
         int valid = Mathf.Max(1, count - nanCount);
+        float fps = _frameMsEMA > 0f ? 1000f / _frameMsEMA : 0f;
         Debug.Log($"[SPH {solverMode}] n={count} h={h:F3} m={mass:F4} dtSub={dtSub:F5} nSub={nSub} | " +
+                  $"frame={_frameMsEMA:F2}ms ({fps:F0} fps) | " +
                   $"rho avg={rhoSum / valid:F1} max={rhoMax:F1} (rho0={restingDensity}) | " +
                   $"V avg={vSum / valid:F3} max={vMax:F3} | Pmax={pMax:F0} | " +
                   $"bbox={(hi - lo):F2} | NaN={nanCount}");
@@ -1082,6 +1085,11 @@ public class SPH : MonoBehaviour
 
     private void Update()
     {
+        // Smoothed frame time (ms) for the in-log profiler. EMA over rendered frames so the
+        // occasional GPU-readback frame in LogDiagnostics doesn't dominate the number.
+        float ms = Time.unscaledDeltaTime * 1000f;
+        _frameMsEMA = _frameMsEMA <= 0f ? ms : Mathf.Lerp(_frameMsEMA, ms, 0.05f);
+
         // Render the master buffer, which Integrate writes back to.
         material.SetFloat(SizeProperty, particleRenderSize);
         material.SetBuffer(ParticlesBufferProperty, _particlesBuffer);
