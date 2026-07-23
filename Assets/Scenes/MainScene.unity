@@ -131,6 +131,7 @@ GameObject:
   - component: {fileID: 553318310}
   - component: {fileID: 553318311}
   - component: {fileID: 553318312}
+  - component: {fileID: 553318313}
   m_Layer: 0
   m_Name: SPH Simulator
   m_TagString: Untagged
@@ -166,7 +167,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   collisionSphere: {fileID: 1168886303}
-  showSpheres: 1
+  showSpheres: 0
   numToSpawn: {x: 32, y: 32, z: 32}
   maxParticles: 131072
   boxSize: {x: 12, y: 20, z: 10}
@@ -177,6 +178,7 @@ MonoBehaviour:
   particleRenderSize: 8
   material: {fileID: 2100000, guid: ea5407f7bde59d6498a95296ae104fd0, type: 2}
   particleColorMode: 1
+  showColor: 0
   speedColorMin: 0
   speedColorMax: 6
   densityColorMinFrac: 0.9
@@ -187,7 +189,7 @@ MonoBehaviour:
   solverMode: 0
   solverIterations: 3
   boundDamping: 0
-  viscosity: 0.15
+  viscosity: 0.015
   particleMass: 1
   restingDensity: 1000
   timeStep: 0.002
@@ -197,28 +199,32 @@ MonoBehaviour:
   maxSubsteps: 16
   enableSurfaceTension: 1
   cohesionAlpha: 0.5
-  curvatureGamma: 0
+  curvatureGamma: 0.5
   adhesionBeta: 0.3
   supportRadius: 0
-  xsphAlpha: 0.1
+  xsphAlpha: 0.03
   enableXSPH: 1
   enableVorticity: 1
   vorticityEps: 0.03
   enableAirDrag: 1
-  airDragCoeff: 1
+  airDensity: 1.2
+  airDragCd: 0.5
+  airDeform: 0.015
+  airNFull: 26
   windVelocity: {x: 0, y: 0, z: 0}
+  airDragCoeff: 1
   airDragSurfaceOnly: 1
   airDragSurfaceThreshold: 0.9
-  enableBoundaryParticles: 0
+  enableBoundaryParticles: 1
   boundaryLayers: 2
   boundarySpacingScale: 1
   enableDiffuse: 1
   maxDiffuse: 40000
   diffuseMaterial: {fileID: 0}
-  diffuseRenderSize: 3
-  diffuseGenRate: 0.6
-  diffuseKEmin: 2
-  diffuseKEmax: 12
+  diffuseRenderSize: 2
+  diffuseGenRate: 1
+  diffuseKEmin: 1.2
+  diffuseKEmax: 7
   diffuseTrappedAir: 1
   diffuseWaveCrest: 1
   diffuseMaxSpawnPerParticle: 4
@@ -308,6 +314,26 @@ MonoBehaviour:
   restingDensity: 1
   timeStep: 0.002
   hashTableSize: 8192
+--- !u!114 &553318313
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 553318307}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: ee9ebc3a816504b78abbcf36595e9eff, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::FluidViewToggle
+  sph: {fileID: 0}
+  surfaceRenderer: {fileID: 0}
+  startMode: 0
+  forceColorModeOnStart: 1
+  startColorMode: 2
+  toggleOnClick: 1
+  toggleKey: 32
+  showLabel: 1
 --- !u!1 &705507993
 GameObject:
   m_ObjectHideFlags: 0
@@ -442,7 +468,7 @@ Camera:
   m_GameObject: {fileID: 963194225}
   m_Enabled: 1
   serializedVersion: 2
-  m_ClearFlags: 2
+  m_ClearFlags: 1
   m_BackGroundColor: {r: 0, g: 0, b: 0, a: 0}
   m_projectionMatrixMode: 2
   m_GateFitMode: 2
@@ -492,13 +518,13 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 963194225}
   serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: -5.54, z: -23.19}
+  m_LocalRotation: {x: 0.30070576, y: 0, z: 0, w: 0.953717}
+  m_LocalPosition: {x: 0, y: 6, z: -24}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+  m_LocalEulerAnglesHint: {x: 35, y: 0, z: 0}
 --- !u!114 &963194229
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -526,7 +552,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 963194225}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: db5f12730756142f784d9f25265bbafd, type: 3}
   m_Name: 
@@ -536,7 +562,11 @@ MonoBehaviour:
   thicknessMat: {fileID: 2100000, guid: 337f8b984b06c436bb0bdc38a63eda85, type: 2}
   blurMat: {fileID: 2100000, guid: 903cb72213aeb427f85d9b35570a684a, type: 2}
   compositeMat: {fileID: 2100000, guid: 991da694385c14617a66dac2149a541f, type: 2}
-  resolutionScale: 0.56
+  resolutionScale: 1
+  smoothDepth: 1
+  depthBlurRadius: 6
+  depthSigmaSpatial: 5
+  depthSigmaRange: 0.4
   renderRadiusScale: 1.4
 --- !u!1 &989571877
 GameObject:
@@ -585,7 +615,7 @@ MeshRenderer:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 989571877}
-  m_Enabled: 1
+  m_Enabled: 0
   m_CastShadows: 1
   m_ReceiveShadows: 1
   m_DynamicOccludee: 1
