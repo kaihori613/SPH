@@ -11,6 +11,10 @@
 #pragma kernel ApplyVorticityConfinement
 #pragma kernel ClearCellRanges
 #pragma kernel InitSortKeys
+#pragma kernel CS_ClearCounts
+#pragma kernel CS_Count
+#pragma kernel CS_Scan
+#pragma kernel CS_Scatter
 #pragma kernel PCIComputeDensity
 #pragma kernel PCINonPressureForces
 #pragma kernel PCIPredictStep
@@ -36,6 +40,8 @@ RWStructuredBuffer<uint> _particleIndices;      // permutation: sorted slot -> m
 RWStructuredBuffer<uint> _sortKeys;             // length = sortLength (padded)
 RWStructuredBuffer<uint> _cellStarts;           // start index (or 0xffffffff if empty)
 RWStructuredBuffer<uint> _cellEnds;             // end index (exclusive)
+RWStructuredBuffer<uint> _cellCount;            // counting sort: particles per cell
+RWStructuredBuffer<uint> _cellScatter;          // counting sort: running write cursor per cell
 RWStructuredBuffer<float3> _particleNormals;
 RWStructuredBuffer<float3> _xsphDelta;
 RWStructuredBuffer<float3> _vorticity;
@@ -228,6 +234,64 @@ void ReorderParticles(uint3 id : SV_DispatchThreadID)
     if (id.x >= particleCount) return;
     uint originalIndex = _particleIndices[id.x];
     _sortedParticles[id.x] = _particles[originalIndex];
+}
+
+// ---------------------------------------------------------------------------
+// Counting sort (Green, "Particle Simulation using CUDA"): O(n) cell-list build
+// that replaces the O(n log^2 n) bitonic path above. Four dispatches vs ~124.
+// Produces the SAME _sortedParticles + _cellStarts/_cellEnds the SPH kernels read;
+// intra-cell order differs (atomic scatter) but SPH sums are order-independent.
+// ---------------------------------------------------------------------------
+
+// 1. Zero per-cell counts.
+[numthreads(256,1,1)]
+void CS_ClearCounts(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_gridCellCount) return;
+    _cellCount[id.x] = 0;
+}
+
+// 2. Histogram: each particle bumps its cell's counter.
+[numthreads(256,1,1)]
+void CS_Count(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+    uint cell = CellLinear(GetCell(_particles[id.x].position));
+    uint old;
+    InterlockedAdd(_cellCount[cell], 1u, old);
+}
+
+// 3. Exclusive prefix sum of the histogram -> _cellStarts, plus _cellEnds and the
+//    scatter cursor. Single-threaded serial scan: dead simple and correct; the cell
+//    count (~37k) is small and the running sum stays in a register, so reads are
+//    sequential/cache-friendly. Optimize to a segmented parallel scan later only if
+//    profiling flags it.
+[numthreads(1,1,1)]
+void CS_Scan(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0) return;
+    uint running = 0;
+    uint n = (uint)_gridCellCount;
+    for (uint c = 0; c < n; c++)
+    {
+        uint cnt = _cellCount[c];
+        _cellStarts[c]  = running;
+        _cellScatter[c] = running;      // write cursor starts at the cell's base
+        running += cnt;
+        _cellEnds[c]    = running;      // exclusive end
+    }
+}
+
+// 4. Scatter each particle into its cell's contiguous slot range.
+[numthreads(256,1,1)]
+void CS_Scatter(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+    uint cell = CellLinear(GetCell(_particles[id.x].position));
+    uint slot;
+    InterlockedAdd(_cellScatter[cell], 1u, slot); // claim the next free slot in this cell
+    _sortedParticles[slot] = _particles[id.x];
+    _particleIndices[slot] = id.x;
 }
 
 // ---------------------------------------------------------------------------

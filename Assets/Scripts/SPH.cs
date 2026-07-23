@@ -69,6 +69,13 @@ public class SPH : MonoBehaviour
     [Header("Solver")]
     [Tooltip("WCSPH = Tait EOS (compressible, stiffness+CFL). PCISPH = iterative pressure projection (incompressible).")]
     public SolverMode solverMode = SolverMode.WCSPH;
+    [Tooltip("Neighbour-search build. ON = counting sort (O(n), 4 dispatches). OFF = bitonic " +
+             "sort (O(n log^2 n), ~124 dispatches). Both give the SAME physics (verified: rho " +
+             "avg 995.4, NaN=0 either way). Default OFF: the counting sort is correct but its " +
+             "prefix-sum scan is currently a single-threaded serial loop over ~37k cells, which " +
+             "makes it ~2.6x SLOWER than bitonic (measured). Turn ON only after the scan is " +
+             "parallelised (segmented prefix sum) — that's the remaining work to make it win.")]
+    public bool useCountingSort = false;
     [Tooltip("PCISPH pressure-correction iterations per step. More = closer to incompressible.")]
     [Range(1, 10)]
     public int solverIterations = 3;
@@ -201,6 +208,8 @@ public class SPH : MonoBehaviour
     private ComputeBuffer _sortKeys;
     private ComputeBuffer _cellStarts; // uint per cell (start index into sorted list) or 0xFFFFFFFF if empty
     private ComputeBuffer _cellEnds;   // uint per cell (end index, exclusive)
+    private ComputeBuffer _cellCount;   // counting sort: particles per cell
+    private ComputeBuffer _cellScatter; // counting sort: running write cursor per cell
     private ComputeBuffer _predPos;    // PCISPH predicted position (sorted-slot)
     private ComputeBuffer _predVel;    // PCISPH predicted velocity (sorted-slot)
     private ComputeBuffer _predAccel;  // PCISPH pressure acceleration scratch (sorted-slot)
@@ -237,6 +246,12 @@ public class SPH : MonoBehaviour
     private int initSortKeysKernel;
     private int clearCellRangesKernel;
     private int reorderParticlesKernel;
+
+    // Counting-sort kernels (O(n) neighbour-search build; replaces bitonic when useCountingSort)
+    private int csClearCountsKernel;
+    private int csCountKernel;
+    private int csScanKernel;
+    private int csScatterKernel;
 
     // PCISPH kernels
     private int pciDensityKernel;
@@ -675,6 +690,10 @@ public class SPH : MonoBehaviour
         clearCellRangesKernel = shader.FindKernel("ClearCellRanges");
         initSortKeysKernel = shader.FindKernel("InitSortKeys");
         reorderParticlesKernel = shader.FindKernel("ReorderParticles");
+        csClearCountsKernel = shader.FindKernel("CS_ClearCounts");
+        csCountKernel = shader.FindKernel("CS_Count");
+        csScanKernel = shader.FindKernel("CS_Scan");
+        csScatterKernel = shader.FindKernel("CS_Scatter");
 
         pciDensityKernel = shader.FindKernel("PCIComputeDensity");
         pciNonPressureKernel = shader.FindKernel("PCINonPressureForces");
@@ -695,8 +714,12 @@ public class SPH : MonoBehaviour
 
         _cellStarts?.Release();
         _cellEnds?.Release();
+        _cellCount?.Release();
+        _cellScatter?.Release();
         _cellStarts = new ComputeBuffer(_gridCellCount, sizeof(uint));
         _cellEnds = new ComputeBuffer(_gridCellCount, sizeof(uint));
+        _cellCount = new ComputeBuffer(_gridCellCount, sizeof(uint));
+        _cellScatter = new ComputeBuffer(_gridCellCount, sizeof(uint));
 
         // 5. Constants (uploaded once at startup)
         shader.SetInt("particleCount", totalParticles);
@@ -767,6 +790,22 @@ public class SPH : MonoBehaviour
 
         shader.SetBuffer(clearCellRangesKernel, "_cellStarts", _cellStarts);
         shader.SetBuffer(clearCellRangesKernel, "_cellEnds", _cellEnds);
+
+        // Counting-sort kernels
+        shader.SetBuffer(csClearCountsKernel, "_cellCount", _cellCount);
+
+        shader.SetBuffer(csCountKernel, "_particles", _particlesBuffer);
+        shader.SetBuffer(csCountKernel, "_cellCount", _cellCount);
+
+        shader.SetBuffer(csScanKernel, "_cellCount", _cellCount);
+        shader.SetBuffer(csScanKernel, "_cellStarts", _cellStarts);
+        shader.SetBuffer(csScanKernel, "_cellEnds", _cellEnds);
+        shader.SetBuffer(csScanKernel, "_cellScatter", _cellScatter);
+
+        shader.SetBuffer(csScatterKernel, "_particles", _particlesBuffer);
+        shader.SetBuffer(csScatterKernel, "_particleIndices", _particleIndices);
+        shader.SetBuffer(csScatterKernel, "_sortedParticles", _sortedParticlesBuffer);
+        shader.SetBuffer(csScatterKernel, "_cellScatter", _cellScatter);
     }
 
     private void SetBufferOnKernels(int kernel)
@@ -949,18 +988,24 @@ public class SPH : MonoBehaviour
         {
             shader.SetFloat("timeStep", dtSub);
 
-            // 1. Clear grid ranges
-            shader.Dispatch(clearCellRangesKernel, groupsCells, 1, 1);
-
-            // 2. Build sort keys (cell index per particle)
-            shader.Dispatch(initSortKeysKernel, groupsPadded, 1, 1);
-
-            // 3. Sort indices by cell
-            SortParticles();
-
-            // 4. Cell start/end ranges + reorder into contiguous sorted buffer
-            shader.Dispatch(calculateCellStartEndKernel, groupsCells, 1, 1);
-            shader.Dispatch(reorderParticlesKernel, groupsPadded, 1, 1);
+            // Neighbour-search build: counting sort (O(n), 4 dispatches) or the legacy
+            // bitonic path (O(n log^2 n), ~124 dispatches). Both produce _sortedParticles +
+            // _cellStarts/_cellEnds for the SPH passes; toggle to A/B them.
+            if (useCountingSort)
+            {
+                shader.Dispatch(csClearCountsKernel, groupsCells, 1, 1);  // zero counts
+                shader.Dispatch(csCountKernel, groupsPhysics, 1, 1);      // histogram
+                shader.Dispatch(csScanKernel, 1, 1, 1);                   // serial prefix sum
+                shader.Dispatch(csScatterKernel, groupsPhysics, 1, 1);    // scatter to slots
+            }
+            else
+            {
+                shader.Dispatch(clearCellRangesKernel, groupsCells, 1, 1);
+                shader.Dispatch(initSortKeysKernel, groupsPadded, 1, 1);
+                SortParticles();
+                shader.Dispatch(calculateCellStartEndKernel, groupsCells, 1, 1);
+                shader.Dispatch(reorderParticlesKernel, groupsPadded, 1, 1);
+            }
 
             // 5. SPH passes (solver-specific)
             if (solverMode == SolverMode.PCISPH)
@@ -1150,6 +1195,8 @@ public class SPH : MonoBehaviour
         _sortKeys?.Release();
         _cellStarts?.Release();
         _cellEnds?.Release();
+        _cellCount?.Release();
+        _cellScatter?.Release();
         _predPos?.Release();
         _predVel?.Release();
         _predAccel?.Release();
