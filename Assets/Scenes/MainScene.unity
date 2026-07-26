@@ -193,7 +193,7 @@ MonoBehaviour:
   viscosity: 0.015
   particleMass: 1
   restingDensity: 1000
-  timeStep: 0.002
+  timeStep: 0.0035
   stiffness: 40
   autoSubsteps: 1
   cflLambda: 0.4
