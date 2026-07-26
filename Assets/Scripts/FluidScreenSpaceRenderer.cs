@@ -40,8 +40,41 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
              "enough to smooth bumps, small enough that separate surfaces stay separate.")]
     public float depthSigmaRange = 0.4f;
 
+    [Header("Curvature flow (van der Laan 2009)")]
+    [Tooltip("Iteratively evolve the front-depth surface along its mean curvature BEFORE the " +
+             "composite reconstructs normals. Unlike the bilateral blur, it dissolves the " +
+             "high-curvature per-particle bumps while preserving flat pools and gentle waves — " +
+             "the surface-reconstruction fix for the 'glass beads' that widening the blur can't " +
+             "touch. Ping-pongs two depth RTs via CommandBuffer DrawMesh (the Metal-safe path). " +
+             "When on, turn depthBlurRadius down (or off) to see it in isolation.")]
+    public bool useCurvatureFlow = false;
+    [Range(0, 120)]
+    [Tooltip("Number of curvature-flow iterations. van der Laan uses tens; more = smoother but " +
+             "costs one fullscreen pass each. With stride 2 and the step clamp, ~15-20 matches " +
+             "what 40 dense iterations did.")]
+    public int curvatureIterations = 20;
+    [Tooltip("Explicit Euler step size. With the per-step clamp this is now forgiving — raise it " +
+             "to smooth faster; if the surface inverts, flip its sign. Tune with iterations.")]
+    public float curvatureDt = 0.01f;
+    [Tooltip("Caps |depth change| per iteration (world units, ~a fraction of particleRadius). " +
+             "This is what kills the per-pixel sparkle: it stops the flow overshooting into a " +
+             "salt-and-pepper instability. Lower = more stable/slower to converge.")]
+    public float curvatureMaxStep = 0.02f;
+    [Range(1, 4)]
+    [Tooltip("Finite-difference stencil width in texels. 1 (recommended) sees the fine " +
+             "per-particle beads and dissolves them; 2+ straddles them (skips both the noise AND " +
+             "the beads) so the surface stays granular. Keep at 1 for bead removal; let the " +
+             "Max Step clamp + composite plane-fit handle the sparkle instead.")]
+    public int curvatureStride = 1;
+    [Tooltip("Insurance toggle: if curvature flow makes the water vanish or render upside-down, " +
+             "a Metal RT viewport Y-flip is the cause — flip this. Costs nothing.")]
+    public bool curvatureFlipY = false;
+    [Tooltip("Shader = Fluid/CurvatureFlow. Assign the material in the Inspector.")]
+    public Material curvatureFlowMat;
+
     RenderTexture _rtThickness, _rtThicknessPing;
     RenderTexture _rtDepthFront;    // front depth as COLOR (view-space z)
+    RenderTexture _rtDepthPing;     // curvature-flow ping-pong target (same format as front)
     RenderTexture _rtMrtDepth;      // dummy 24-bit depth for MRT binding
     Mesh _quadMesh;
     CommandBuffer _cmd;             // immediate-mode draw into the MRT (see OnRenderImage)
@@ -73,6 +106,7 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
         if (_rtThickness)     { _rtThickness.Release();     _rtThickness = null; }
         if (_rtThicknessPing) { _rtThicknessPing.Release(); _rtThicknessPing = null; }
         if (_rtDepthFront)    { _rtDepthFront.Release();    _rtDepthFront = null; }
+        if (_rtDepthPing)     { _rtDepthPing.Release();     _rtDepthPing = null; }
         if (_rtMrtDepth)      { _rtMrtDepth.Release();      _rtMrtDepth = null; }
     }
 
@@ -98,6 +132,12 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
         _rtDepthFront = new RenderTexture(rw, rh, 0, RenderTextureFormat.RFloat)
         { name = "Fluid_FrontDepth", filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
         _rtDepthFront.Create();
+
+        // Curvature-flow ping-pong partner (same format/size). Point filtering: the flow reads
+        // exact texels; bilinear would blur the sentinel edge into the fluid.
+        _rtDepthPing = new RenderTexture(rw, rh, 0, RenderTextureFormat.RFloat)
+        { name = "Fluid_FrontDepth_Ping", filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
+        _rtDepthPing.Create();
 
         // Dummy depth RT for MRT binding (same size)
         _rtMrtDepth = new RenderTexture(rw, rh, 24, RenderTextureFormat.Depth)
@@ -168,6 +208,37 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
         _cmd.DrawMeshInstancedIndirect(_quadMesh, 0, thicknessMat, 0, _argsBuf);
         _cmd.SetRenderTarget(_rtDepthFront);
         _cmd.DrawMeshInstancedIndirect(_quadMesh, 0, thicknessMat, 1, _argsBuf);
+
+        // 1b. Curvature flow: N mean-curvature-flow iterations on the front depth, appended to
+        // the SAME command buffer (ordered after the splat draws). Ping-pong Front<->Ping using
+        // SetRenderTarget + a fullscreen DrawMesh — NOT Blit, which collapses the RFloat RT to
+        // background on this Metal path. _DepthTex is rebound (global) each iteration to the read
+        // side; Unity keeps _DepthTex_TexelSize in sync with it.
+        RenderTexture depthForComposite = _rtDepthFront;
+        if (useCurvatureFlow && curvatureFlowMat && curvatureIterations > 0)
+        {
+            curvatureFlowMat.SetMatrix("_Proj", cam.projectionMatrix);
+            curvatureFlowMat.SetFloat ("_FlowDt", curvatureDt);
+            curvatureFlowMat.SetFloat ("_MaxStep", curvatureMaxStep);
+            curvatureFlowMat.SetInt   ("_FlowStride", Mathf.Max(1, curvatureStride));
+            curvatureFlowMat.SetFloat ("_UvFlipY", curvatureFlipY ? 1f : 0f);
+
+            // Both ping RTs share this size; bind explicitly so the flow shader's texel step is
+            // correct even if the auto _TexelSize companion isn't populated for a cmd-global set.
+            int dw = _rtDepthFront.width, dh = _rtDepthFront.height;
+            _cmd.SetGlobalVector("_DepthTex_TexelSize", new Vector4(1f / dw, 1f / dh, dw, dh));
+
+            RenderTexture read = _rtDepthFront, write = _rtDepthPing;
+            for (int it = 0; it < curvatureIterations; it++)
+            {
+                _cmd.SetGlobalTexture("_DepthTex", read);
+                _cmd.SetRenderTarget(write);
+                _cmd.DrawMesh(_quadMesh, Matrix4x4.identity, curvatureFlowMat, 0, 0);
+                var tmp = read; read = write; write = tmp;   // swap
+            }
+            depthForComposite = read;   // last buffer written is now the read side after the final swap
+        }
+
         Graphics.ExecuteCommandBuffer(_cmd);
 
         // 2. Depth smoothing is done INSIDE the composite shader (bilateral tap before normal
@@ -193,9 +264,13 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
             compositeMat.SetColor("_SunColor", Color.black); // no sun, no specular
         }
         compositeMat.SetTexture("_SceneTex", src);
-        compositeMat.SetTexture("_DepthTex", _rtDepthFront);
+        compositeMat.SetTexture("_DepthTex", depthForComposite); // curvature-smoothed when enabled
         compositeMat.SetTexture("_ThicknessTex", _rtThickness);
         compositeMat.SetMatrix ("_Proj", cam.projectionMatrix);
+        // Passed explicitly rather than relying on unity_CameraToWorld: the composite runs as a
+        // Blit inside OnRenderImage, and this file already avoids trusting camera built-ins here.
+        // Used to take the view-space reflection dir into world space for the env lookup.
+        compositeMat.SetMatrix ("_CamToWorld", cam.cameraToWorldMatrix);
 
         Graphics.Blit(src, dst, compositeMat);
     }

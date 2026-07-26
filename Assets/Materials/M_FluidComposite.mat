@@ -86,13 +86,15 @@ Material:
     - _Mode: 0
     - _OcclusionStrength: 1
     - _Parallax: 0.02
+    - _ReflIntensity: 1
     - _RefractScale: 0.02
-    - _SmoothRadius: 6
-    - _SmoothSigmaR: 0.4
-    - _SmoothSigmaS: 5
+    - _SmoothRadius: 12
+    - _SmoothSigmaR: 10
+    - _SmoothSigmaS: 12
+    - _SmoothStride: 2
     - _SmoothnessTextureChannel: 0
-    - _SpecIntensity: 1
-    - _SpecPower: 150
+    - _SpecIntensity: 0.3
+    - _SpecPower: 40
     - _SpecularHighlights: 1
     - _SrcBlend: 1
     - _UVSec: 0
@@ -100,6 +102,9 @@ Material:
     m_Colors:
     - _Color: {r: 1, g: 1, b: 1, a: 1}
     - _EmissionColor: {r: 0, g: 0, b: 0, a: 1}
-    - _SigmaA: {r: 0.15, g: 0.06, b: 0.03, a: 0}
+    - _SigmaA: {r: 0.075, g: 0.03, b: 0.015, a: 0}
+    - _SkyGround: {r: 0.21999997, g: 0.19999996, b: 0.17999998, a: 1}
+    - _SkyHorizon: {r: 0.62, g: 0.65999997, b: 0.7, a: 1}
+    - _SkyZenith: {r: 0.29999998, g: 0.45, b: 0.72, a: 1}
   m_BuildTextureStacks: []
   m_AllowLocking: 1

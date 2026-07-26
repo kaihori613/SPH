@@ -168,7 +168,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   collisionSphere: {fileID: 1168886303}
   showSpheres: 0
-  numToSpawn: {x: 32, y: 32, z: 32}
+  numToSpawn: {x: 40, y: 40, z: 40}
   maxParticles: 131072
   boxSize: {x: 12, y: 20, z: 10}
   spawnCenter: {x: -3.9, y: 0, z: -3.9}
@@ -187,6 +187,7 @@ MonoBehaviour:
   shader: {fileID: 7200000, guid: 24c53b183693d42c1bced2db06b0dd3d, type: 3}
   particles: []
   solverMode: 0
+  useCountingSort: 1
   solverIterations: 3
   boundDamping: 0
   viscosity: 0.015
@@ -218,7 +219,7 @@ MonoBehaviour:
   enableBoundaryParticles: 1
   boundaryLayers: 2
   boundarySpacingScale: 1
-  enableDiffuse: 1
+  enableDiffuse: 0
   maxDiffuse: 40000
   diffuseMaterial: {fileID: 0}
   diffuseRenderSize: 2
@@ -562,12 +563,20 @@ MonoBehaviour:
   thicknessMat: {fileID: 2100000, guid: 337f8b984b06c436bb0bdc38a63eda85, type: 2}
   blurMat: {fileID: 2100000, guid: 903cb72213aeb427f85d9b35570a684a, type: 2}
   compositeMat: {fileID: 2100000, guid: 991da694385c14617a66dac2149a541f, type: 2}
-  resolutionScale: 1
+  resolutionScale: 0.5
   smoothDepth: 1
-  depthBlurRadius: 6
-  depthSigmaSpatial: 5
-  depthSigmaRange: 0.4
-  renderRadiusScale: 1.4
+  depthBlurRadius: 12
+  depthBlurStride: 2
+  depthSigmaSpatial: 12
+  depthSigmaRange: 10
+  useCurvatureFlow: 1
+  curvatureIterations: 10
+  curvatureDt: 0.01
+  curvatureMaxStep: 0.02
+  curvatureStride: 1
+  curvatureFlipY: 0
+  curvatureFlowMat: {fileID: 2100000, guid: 82ef2be1d19748fb8a9598e6a39de51d, type: 2}
+  renderRadiusScale: 1.8
 --- !u!1 &989571877
 GameObject:
   m_ObjectHideFlags: 0
@@ -586,7 +595,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!65 &989571878
 BoxCollider:
   m_ObjectHideFlags: 0
@@ -673,8 +682,8 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 989571877}
   serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0.12, y: -7.97, z: 0.02}
+  m_LocalRotation: {x: 0.16317208, y: -0.66968495, z: 0.1555625, w: 0.7075997}
+  m_LocalPosition: {x: 413.61627, y: 194.79257, z: -26.04692}
   m_LocalScale: {x: -7.712116, y: 1.0738436, z: 8.200156}
   m_ConstrainProportionsScale: 0
   m_Children: []
