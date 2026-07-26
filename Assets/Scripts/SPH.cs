@@ -210,6 +210,7 @@ public class SPH : MonoBehaviour
     private ComputeBuffer _cellEnds;   // uint per cell (end index, exclusive)
     private ComputeBuffer _cellCount;   // counting sort: particles per cell
     private ComputeBuffer _cellScatter; // counting sort: running write cursor per cell
+    private ComputeBuffer _cellBlockSums; // parallel scan: per-block totals/offsets
     private ComputeBuffer _predPos;    // PCISPH predicted position (sorted-slot)
     private ComputeBuffer _predVel;    // PCISPH predicted velocity (sorted-slot)
     private ComputeBuffer _predAccel;  // PCISPH pressure acceleration scratch (sorted-slot)
@@ -251,6 +252,9 @@ public class SPH : MonoBehaviour
     private int csClearCountsKernel;
     private int csCountKernel;
     private int csScanKernel;
+    private int csScanBlocksKernel;
+    private int csScanBlockSumsKernel;
+    private int csAddOffsetsKernel;
     private int csScatterKernel;
 
     // PCISPH kernels
@@ -693,6 +697,9 @@ public class SPH : MonoBehaviour
         csClearCountsKernel = shader.FindKernel("CS_ClearCounts");
         csCountKernel = shader.FindKernel("CS_Count");
         csScanKernel = shader.FindKernel("CS_Scan");
+        csScanBlocksKernel = shader.FindKernel("CS_ScanBlocks");
+        csScanBlockSumsKernel = shader.FindKernel("CS_ScanBlockSums");
+        csAddOffsetsKernel = shader.FindKernel("CS_AddOffsets");
         csScatterKernel = shader.FindKernel("CS_Scatter");
 
         pciDensityKernel = shader.FindKernel("PCIComputeDensity");
@@ -712,20 +719,26 @@ public class SPH : MonoBehaviour
         _gridRes = new int3(rx, ry, rz);
         _gridCellCount = rx * ry * rz;
 
+        // Parallel-scan block count: one 256-wide block per THREADS cells.
+        int numScanBlocks = Mathf.CeilToInt((float)_gridCellCount / THREADS);
+
         _cellStarts?.Release();
         _cellEnds?.Release();
         _cellCount?.Release();
         _cellScatter?.Release();
+        _cellBlockSums?.Release();
         _cellStarts = new ComputeBuffer(_gridCellCount, sizeof(uint));
         _cellEnds = new ComputeBuffer(_gridCellCount, sizeof(uint));
         _cellCount = new ComputeBuffer(_gridCellCount, sizeof(uint));
         _cellScatter = new ComputeBuffer(_gridCellCount, sizeof(uint));
+        _cellBlockSums = new ComputeBuffer(numScanBlocks, sizeof(uint));
 
         // 5. Constants (uploaded once at startup)
         shader.SetInt("particleCount", totalParticles);
         shader.SetInt("sortLength", paddedParticles);
         shader.SetInts("_gridRes", new int[] { rx, ry, rz });
         shader.SetInt("_gridCellCount", _gridCellCount);
+        shader.SetInt("_numScanBlocks", numScanBlocks);
         shader.SetFloat("viscosity", viscosity);
         shader.SetFloat("restDensity", restingDensity);
         shader.SetFloat("boundDamping", boundDamping);
@@ -801,6 +814,19 @@ public class SPH : MonoBehaviour
         shader.SetBuffer(csScanKernel, "_cellStarts", _cellStarts);
         shader.SetBuffer(csScanKernel, "_cellEnds", _cellEnds);
         shader.SetBuffer(csScanKernel, "_cellScatter", _cellScatter);
+
+        // Parallel scan (three passes) — replaces the serial csScan.
+        shader.SetBuffer(csScanBlocksKernel, "_cellCount", _cellCount);
+        shader.SetBuffer(csScanBlocksKernel, "_cellStarts", _cellStarts);
+        shader.SetBuffer(csScanBlocksKernel, "_cellBlockSums", _cellBlockSums);
+
+        shader.SetBuffer(csScanBlockSumsKernel, "_cellBlockSums", _cellBlockSums);
+
+        shader.SetBuffer(csAddOffsetsKernel, "_cellCount", _cellCount);
+        shader.SetBuffer(csAddOffsetsKernel, "_cellStarts", _cellStarts);
+        shader.SetBuffer(csAddOffsetsKernel, "_cellEnds", _cellEnds);
+        shader.SetBuffer(csAddOffsetsKernel, "_cellScatter", _cellScatter);
+        shader.SetBuffer(csAddOffsetsKernel, "_cellBlockSums", _cellBlockSums);
 
         shader.SetBuffer(csScatterKernel, "_particles", _particlesBuffer);
         shader.SetBuffer(csScatterKernel, "_particleIndices", _particleIndices);
@@ -993,10 +1019,15 @@ public class SPH : MonoBehaviour
             // _cellStarts/_cellEnds for the SPH passes; toggle to A/B them.
             if (useCountingSort)
             {
-                shader.Dispatch(csClearCountsKernel, groupsCells, 1, 1);  // zero counts
-                shader.Dispatch(csCountKernel, groupsPhysics, 1, 1);      // histogram
-                shader.Dispatch(csScanKernel, 1, 1, 1);                   // serial prefix sum
-                shader.Dispatch(csScatterKernel, groupsPhysics, 1, 1);    // scatter to slots
+                shader.Dispatch(csClearCountsKernel, groupsCells, 1, 1);      // zero counts
+                shader.Dispatch(csCountKernel, groupsPhysics, 1, 1);          // histogram
+                // Parallel prefix scan (3 passes): per-block scan, scan the block
+                // totals, add offsets back. Replaces the single-thread serial scan so
+                // the sort no longer stalls the GPU each substep.
+                shader.Dispatch(csScanBlocksKernel, groupsCells, 1, 1);       // per-block exclusive scan
+                shader.Dispatch(csScanBlockSumsKernel, 1, 1, 1);             // scan the (few) block totals
+                shader.Dispatch(csAddOffsetsKernel, groupsCells, 1, 1);       // add block offsets -> starts/ends
+                shader.Dispatch(csScatterKernel, groupsPhysics, 1, 1);        // scatter to slots
             }
             else
             {
@@ -1197,6 +1228,7 @@ public class SPH : MonoBehaviour
         _cellEnds?.Release();
         _cellCount?.Release();
         _cellScatter?.Release();
+        _cellBlockSums?.Release();
         _predPos?.Release();
         _predVel?.Release();
         _predAccel?.Release();

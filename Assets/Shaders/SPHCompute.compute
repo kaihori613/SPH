@@ -14,6 +14,9 @@
 #pragma kernel CS_ClearCounts
 #pragma kernel CS_Count
 #pragma kernel CS_Scan
+#pragma kernel CS_ScanBlocks
+#pragma kernel CS_ScanBlockSums
+#pragma kernel CS_AddOffsets
 #pragma kernel CS_Scatter
 #pragma kernel PCIComputeDensity
 #pragma kernel PCINonPressureForces
@@ -42,6 +45,7 @@ RWStructuredBuffer<uint> _cellStarts;           // start index (or 0xffffffff if
 RWStructuredBuffer<uint> _cellEnds;             // end index (exclusive)
 RWStructuredBuffer<uint> _cellCount;            // counting sort: particles per cell
 RWStructuredBuffer<uint> _cellScatter;          // counting sort: running write cursor per cell
+RWStructuredBuffer<uint> _cellBlockSums;        // parallel scan: per-256-block totals, then block offsets
 RWStructuredBuffer<float3> _particleNormals;
 RWStructuredBuffer<float3> _xsphDelta;
 RWStructuredBuffer<float3> _vorticity;
@@ -56,6 +60,7 @@ uint particleCount;   // real particle count
 uint sortLength;      // padded (power of two)
 int3 _gridRes;
 int _gridCellCount;
+int _numScanBlocks;   // ceil(_gridCellCount / 256): number of scan blocks (== groupsCells)
 
 // Fluid constants
 float particleMass;
@@ -280,6 +285,72 @@ void CS_Scan(uint3 id : SV_DispatchThreadID)
         running += cnt;
         _cellEnds[c]    = running;      // exclusive end
     }
+}
+
+// --- Parallel prefix scan (replaces the serial CS_Scan above) --------------
+// The serial scan is one GPU thread walking all _gridCellCount cells; run every
+// substep it stalls the whole device. This is the standard three-pass scan:
+//   CS_ScanBlocks    per-256-block EXCLUSIVE scan in groupshared -> _cellStarts
+//                    (block-local), each block's total -> _cellBlockSums.
+//   CS_ScanBlockSums serial EXCLUSIVE scan of the block totals (only
+//                    ceil(cells/256) of them ~ hundreds, so cheap) -> block offsets.
+//   CS_AddOffsets    add each block's offset back and emit the final
+//                    _cellStarts/_cellEnds/_cellScatter.
+// Net: the O(cells) work is parallel; the only serial part shrinks 256x.
+groupshared uint gScan[256];
+
+[numthreads(256,1,1)]
+void CS_ScanBlocks(uint3 gid : SV_DispatchThreadID, uint tid : SV_GroupIndex, uint3 grp : SV_GroupID)
+{
+    uint n = (uint)_gridCellCount;
+    uint i = gid.x;
+    uint v = (i < n) ? _cellCount[i] : 0u;
+    gScan[tid] = v;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Inclusive Hillis-Steele scan within the 256-wide block. Barriers on both
+    // sides of the write keep the read of gScan[tid-off] race-free.
+    [unroll]
+    for (uint off = 1u; off < 256u; off <<= 1)
+    {
+        uint add = (tid >= off) ? gScan[tid - off] : 0u;
+        GroupMemoryBarrierWithGroupSync();
+        gScan[tid] += add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (i < n) _cellStarts[i] = gScan[tid] - v;          // block-local EXCLUSIVE prefix
+    if (tid == 255u) _cellBlockSums[grp.x] = gScan[255]; // this block's total
+}
+
+// Serial exclusive scan of the (few) block totals. One thread, but over
+// ceil(cells/256) elements instead of cells — hundreds vs tens of thousands.
+[numthreads(1,1,1)]
+void CS_ScanBlockSums(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0u) return;
+    uint running = 0u;
+    uint nb = (uint)_numScanBlocks;
+    for (uint b = 0u; b < nb; b++)
+    {
+        uint s = _cellBlockSums[b];
+        _cellBlockSums[b] = running;   // exclusive offset for block b
+        running += s;
+    }
+}
+
+// Add each block's global offset to its block-local prefix and emit the final
+// per-cell start/end plus the scatter cursor.
+[numthreads(256,1,1)]
+void CS_AddOffsets(uint3 gid : SV_DispatchThreadID, uint3 grp : SV_GroupID)
+{
+    uint i = gid.x;
+    if (i >= (uint)_gridCellCount) return;
+    uint start = _cellStarts[i] + _cellBlockSums[grp.x];
+    uint cnt   = _cellCount[i];
+    _cellStarts[i]  = start;
+    _cellScatter[i] = start;   // write cursor starts at the cell's base
+    _cellEnds[i]    = start + cnt;
 }
 
 // 4. Scatter each particle into its cell's contiguous slot range.
