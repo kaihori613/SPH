@@ -236,8 +236,14 @@ Shader "Fluid/Composite"
                 float3 V = normalize(-P); // view vector in view space
                 float F = _F0 + (1 - _F0) * pow(1 - saturate(dot(N, V)), 5); // Schlick's approx
 
-                // cheap refraction: offset by normal
-                float2 rUV = saturate(uv + _RefractScale * (N.xy / max(-N.z, 0.05))); // view-space to screen-space: divide by -z
+                // cheap refraction: offset by normal (view-space -> screen-space via /-z).
+                // The -N.z floor was 0.05, which let the offset hit ~20x at grazing normals
+                // (every surface bump's silhouette), sampling far into the dark background ->
+                // the dark "labyrinth" ridges / voids around bumps. Raise the floor and hard-cap
+                // the excursion so bumps refract GENTLY; flat surfaces (small N.xy) are unaffected.
+                float2 rDir = N.xy / max(-N.z, 0.25);          // was 0.05: caps 20x -> ~4x
+                float2 rOff = _RefractScale * clamp(rDir, -4.0, 4.0);
+                float2 rUV  = saturate(uv + rOff);
 
                 float3 refr = tex2D(_SceneTex, rUV).rgb * transmittance; // refracted color
 

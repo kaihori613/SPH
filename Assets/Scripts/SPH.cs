@@ -184,6 +184,13 @@ public class SPH : MonoBehaviour
     public bool autoMassFromRadius = true;  // mass = rho0 * spacing^3
     public bool clampSupportRadius = true;  // keep h ~ 2x spacing
 
+    [Header("Surface render smoothing (Yu-Turk)")]
+    [Range(0f, 1f)]
+    [Tooltip("Blends each particle's RENDER position toward its neighbours' weighted mean before " +
+             "the screen-space splat (physics positions are untouched). 0 = raw (per-particle " +
+             "lumps/creases); ~0.9 = smooth surface. Stage 1 of anisotropic-kernel rendering.")]
+    public float renderPosSmoothLambda = 0.9f;
+
     [Header("Time Integration")]
     [Min(1)]
     public int substeps = 1; // used only when autoSubsteps == false
@@ -203,6 +210,8 @@ public class SPH : MonoBehaviour
     public ComputeBuffer _sortedParticlesBuffer;  // sorted linear buffer for fast physics
     private ComputeBuffer _particleIndices;
     private ComputeBuffer _particleNormalsBuffer;
+    private ComputeBuffer _renderPositions;     // Yu-Turk smoothed positions for the surface renderer
+    public ComputeBuffer RenderPositions => _renderPositions;
     private ComputeBuffer _xsphDelta;
     private ComputeBuffer _vorticity;
     private ComputeBuffer _sortKeys;
@@ -238,6 +247,7 @@ public class SPH : MonoBehaviour
     private int computeForceKernel;
     private int densityPressureKernel;
     private int computeNormalsKernel;
+    private int computeRenderPositionsKernel;
     private int sortKernel;
     private int calculateCellStartEndKernel;
     private int computeXsphKernel;
@@ -670,6 +680,10 @@ public class SPH : MonoBehaviour
         _particleIndices = new ComputeBuffer(paddedParticles, sizeof(uint));
         _sortKeys = new ComputeBuffer(paddedParticles, sizeof(uint));
         _particleNormalsBuffer = new ComputeBuffer(paddedParticles, sizeof(float) * 3);
+        // Zero-init: padded slots (count..padded) are drawn too and read this buffer; zeros put
+        // them at the origin, matching the master buffer's padded behaviour before this change.
+        _renderPositions = new ComputeBuffer(paddedParticles, sizeof(float) * 3);
+        _renderPositions.SetData(new Vector3[paddedParticles]);
         _xsphDelta = new ComputeBuffer(paddedParticles, sizeof(float) * 3);
         _vorticity = new ComputeBuffer(paddedParticles, sizeof(float) * 3);
         _predPos = new ComputeBuffer(paddedParticles, sizeof(float) * 3);
@@ -685,6 +699,7 @@ public class SPH : MonoBehaviour
         computeForceKernel = shader.FindKernel("ComputeForces");
         densityPressureKernel = shader.FindKernel("ComputeDensityPressure");
         computeNormalsKernel = shader.FindKernel("ComputeNormals");
+        computeRenderPositionsKernel = shader.FindKernel("ComputeRenderPositions");
         sortKernel = shader.FindKernel("BitonicSort");
         calculateCellStartEndKernel = shader.FindKernel("CalculateCellStartEnd");
         computeXsphKernel = shader.FindKernel("ComputeXSPH");
@@ -765,6 +780,8 @@ public class SPH : MonoBehaviour
         SetBufferOnKernels(densityPressureKernel);
         SetBufferOnKernels(computeForceKernel);
         SetBufferOnKernels(computeNormalsKernel);
+        SetBufferOnKernels(computeRenderPositionsKernel);
+        shader.SetBuffer(computeRenderPositionsKernel, "_renderPositions", _renderPositions);
         SetBufferOnKernels(computeXsphKernel);
         SetBufferOnKernels(applyXsphKernel);
         SetBufferOnKernels(computeVorticityKernel);
@@ -1082,6 +1099,11 @@ public class SPH : MonoBehaviour
             shader.Dispatch(integrateKernel, groupsPhysics, 1, 1);
         }
 
+        // Yu-Turk smoothed render positions: once per FixedUpdate, reusing the last substep's
+        // grid (still bound), same as the diffuse pass below. Render-only; physics untouched.
+        shader.SetFloat("_renderSmoothLambda", renderPosSmoothLambda); // live-tunable
+        shader.Dispatch(computeRenderPositionsKernel, groupsPhysics, 1, 1);
+
         // Diffuse particles: once per FixedUpdate, reusing the last substep's grid (still bound).
         // Advect/age the existing pool first, then spawn new markers from the current fluid state.
         if (enableDiffuse && _diffuseReady)
@@ -1221,6 +1243,7 @@ public class SPH : MonoBehaviour
         _sortedParticlesBuffer?.Release();
         _particleIndices?.Release();
         _particleNormalsBuffer?.Release();
+        _renderPositions?.Release();
         _xsphDelta?.Release();
         _vorticity?.Release();
         _sortKeys?.Release();

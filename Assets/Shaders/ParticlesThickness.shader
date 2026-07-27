@@ -19,6 +19,7 @@ Shader "Fluid/ParticlesThickness"
     };
 
     StructuredBuffer<Particle> _particlesBuffer;
+    StructuredBuffer<float3> _renderPositions; // Yu-Turk smoothed centres (sorted-slot indexed)
 
     float _ParticleRadius;
     float4x4 _VP;
@@ -44,7 +45,7 @@ Shader "Fluid/ParticlesThickness"
         float2 q = v.uv * 2.0 - 1.0;
         float r = _ParticleRadius;
 
-        float3 Cw = _particlesBuffer[inst].position; // particle center in world space
+        float3 Cw = _renderPositions[inst]; // Yu-Turk smoothed centre (was _particlesBuffer[inst].position)
         float3 Pw = Cw + r * (q.x * _CamRight + q.y * _CamUp);
 
         o.pos = mul(_VP, float4(Pw, 1));

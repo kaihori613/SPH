@@ -150,7 +150,7 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
         if (!cam) cam = Camera.main;
 
         // bail if not set up
-        if (!sph || sph._particlesBuffer == null || sph._particlesBuffer.count == 0 || !thicknessMat || !compositeMat)
+        if (!sph || sph._particlesBuffer == null || sph._particlesBuffer.count == 0 || sph.RenderPositions == null || !thicknessMat || !compositeMat)
         {
             Graphics.Blit(src, dst);
             return;
@@ -171,6 +171,7 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
         thicknessMat.SetVector("_CamUp",    cam.transform.up);
         thicknessMat.SetFloat ("_ParticleRadius", sph.particleRadius * renderRadiusScale);
         thicknessMat.SetBuffer("_particlesBuffer", sph._particlesBuffer);
+        thicknessMat.SetBuffer("_renderPositions", sph.RenderPositions); // Yu-Turk smoothed centres (Stage 1)
 
          // Clear thickness to 0
         Graphics.SetRenderTarget(_rtThickness);

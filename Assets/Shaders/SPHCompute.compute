@@ -2,6 +2,7 @@
 #pragma kernel ComputeForces
 #pragma kernel ComputeDensityPressure
 #pragma kernel ComputeNormals
+#pragma kernel ComputeRenderPositions
 #pragma kernel BitonicSort
 #pragma kernel ReorderParticles
 #pragma kernel CalculateCellStartEnd
@@ -47,6 +48,7 @@ RWStructuredBuffer<uint> _cellCount;            // counting sort: particles per 
 RWStructuredBuffer<uint> _cellScatter;          // counting sort: running write cursor per cell
 RWStructuredBuffer<uint> _cellBlockSums;        // parallel scan: per-256-block totals, then block offsets
 RWStructuredBuffer<float3> _particleNormals;
+RWStructuredBuffer<float3> _renderPositions; // Yu-Turk smoothed positions for rendering only (sorted-slot indexed)
 RWStructuredBuffer<float3> _xsphDelta;
 RWStructuredBuffer<float3> _vorticity;
 
@@ -96,6 +98,10 @@ float adhesionC;      // = 0.007 / pow(h, 3.25)
 // XSPH
 int enableXSPH;
 float xsphAlpha;
+
+// Render-position smoothing (Yu-Turk 2010, eq. for x_bar): blend factor toward the
+// weighted neighbour mean. 0 = raw particle positions, ~0.9 = strongly smoothed surface.
+float _renderSmoothLambda;
 
 // Vorticity
 int enableVorticity;
@@ -557,6 +563,54 @@ void ComputeDensityPressure(uint3 id : SV_DispatchThreadID)
     float k_tait = (stiffness * stiffness * restDensity) / gamma;
     float p = k_tait * (pow(rhoSafe / restDensity, gamma) - 1.0);
     _sortedParticles[id.x].pressure = max(0.0f, p);
+}
+
+// Yu-Turk 2010 §4: nudge each particle toward the weighted mean of its neighbours before
+// splatting. This alone removes most of the per-particle surface lumpiness (the "worm"/crease
+// pattern) WITHOUT touching the physics — it writes a separate render-only position buffer.
+// Sorted-slot indexed: the splat draws all slots and reads _renderPositions[inst] directly.
+// Weight is Yu-Turk's w = 1 - (r/h)^3 (1 at the particle, 0 at the support radius).
+[numthreads(256,1,1)]
+void ComputeRenderPositions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    float3 xi = _sortedParticles[id.x].position;
+    int3 cell = GetCell(xi);
+
+    float3 wsumX = float3(0, 0, 0);
+    float wsum = 0.0;
+
+    for (int i = -1; i <= 1; i++){
+        for (int j = -1; j <= 1; j++){
+            for (int k = -1; k <= 1; k++){
+                int3 n = cell + int3(i, j, k);
+                if (any(n < 0) || any(n >= _gridRes)) continue;
+
+                uint cIdx = CellLinear(n);
+                uint start = _cellStarts[cIdx];
+                if (start == 0xffffffffu) continue;
+                uint end = _cellEnds[cIdx];
+
+                for (uint t = start; t < end; ++t)
+                {
+                    float3 xj = _sortedParticles[t].position;
+                    float3 d = xi - xj;
+                    float r2 = dot(d, d);
+                    if (r2 < h2)
+                    {
+                        float rn = sqrt(r2) * invH;         // r / h in [0,1)
+                        float w = 1.0 - rn * rn * rn;        // Yu-Turk cubic weight
+                        wsumX += w * xj;
+                        wsum  += w;
+                    }
+                }
+            }
+        }
+    }
+
+    float3 xbar = (wsum > 1e-6) ? (wsumX / wsum) : xi;
+    _renderPositions[id.x] = lerp(xi, xbar, saturate(_renderSmoothLambda));
 }
 
 [numthreads(256,1,1)]
