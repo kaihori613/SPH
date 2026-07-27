@@ -219,7 +219,7 @@ MonoBehaviour:
   enableBoundaryParticles: 1
   boundaryLayers: 2
   boundarySpacingScale: 1
-  enableDiffuse: 0
+  enableDiffuse: 1
   maxDiffuse: 40000
   diffuseMaterial: {fileID: 0}
   diffuseRenderSize: 2
@@ -237,6 +237,7 @@ MonoBehaviour:
   diffuseDrag: 8
   autoMassFromRadius: 1
   clampSupportRadius: 1
+  renderPosSmoothLambda: 0.9
   substeps: 1
   logDiagnostics: 0
   logInterval: 60
@@ -520,7 +521,7 @@ Transform:
   m_GameObject: {fileID: 963194225}
   serializedVersion: 2
   m_LocalRotation: {x: 0.30070576, y: 0, z: 0, w: 0.953717}
-  m_LocalPosition: {x: 0, y: 6, z: -24}
+  m_LocalPosition: {x: 0, y: 7.05, z: -23.27}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -563,20 +564,22 @@ MonoBehaviour:
   thicknessMat: {fileID: 2100000, guid: 337f8b984b06c436bb0bdc38a63eda85, type: 2}
   blurMat: {fileID: 2100000, guid: 903cb72213aeb427f85d9b35570a684a, type: 2}
   compositeMat: {fileID: 2100000, guid: 991da694385c14617a66dac2149a541f, type: 2}
-  resolutionScale: 0.5
+  resolutionScale: 1
   smoothDepth: 1
   depthBlurRadius: 12
   depthBlurStride: 2
-  depthSigmaSpatial: 12
+  depthSigmaSpatial: 24
   depthSigmaRange: 10
   useCurvatureFlow: 1
-  curvatureIterations: 10
+  curvatureIterations: 20
   curvatureDt: 0.01
   curvatureMaxStep: 0.02
   curvatureStride: 1
   curvatureFlipY: 0
   curvatureFlowMat: {fileID: 2100000, guid: 82ef2be1d19748fb8a9598e6a39de51d, type: 2}
-  renderRadiusScale: 1.8
+  renderRadiusScale: 1.2
+  flattenK: 0.5
+  anisoConfScale: 2
 --- !u!1 &989571877
 GameObject:
   m_ObjectHideFlags: 0
