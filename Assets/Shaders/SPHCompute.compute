@@ -49,6 +49,7 @@ RWStructuredBuffer<uint> _cellScatter;          // counting sort: running write 
 RWStructuredBuffer<uint> _cellBlockSums;        // parallel scan: per-256-block totals, then block offsets
 RWStructuredBuffer<float3> _particleNormals;
 RWStructuredBuffer<float3> _renderPositions; // Yu-Turk smoothed positions for rendering only (sorted-slot indexed)
+RWStructuredBuffer<float4> _renderAniso;     // Stage 2: xyz = surface-normal flatten axis, w = |normal| (surface confidence)
 RWStructuredBuffer<float3> _xsphDelta;
 RWStructuredBuffer<float3> _vorticity;
 
@@ -580,6 +581,7 @@ void ComputeRenderPositions(uint3 id : SV_DispatchThreadID)
 
     float3 wsumX = float3(0, 0, 0);
     float wsum = 0.0;
+    float3 nrm = float3(0, 0, 0); // colour-field gradient -> surface normal (the flatten axis)
 
     for (int i = -1; i <= 1; i++){
         for (int j = -1; j <= 1; j++){
@@ -603,6 +605,10 @@ void ComputeRenderPositions(uint3 id : SV_DispatchThreadID)
                         float w = 1.0 - rn * rn * rn;        // Yu-Turk cubic weight
                         wsumX += w * xj;
                         wsum  += w;
+
+                        float dist = sqrt(r2);
+                        if (dist > 1e-6)                     // skip self; accumulate normal
+                            nrm += (particleMass / _sortedParticles[t].density) * gradSpiky(d, dist);
                     }
                 }
             }
@@ -611,6 +617,14 @@ void ComputeRenderPositions(uint3 id : SV_DispatchThreadID)
 
     float3 xbar = (wsum > 1e-6) ? (wsumX / wsum) : xi;
     _renderPositions[id.x] = lerp(xi, xbar, saturate(_renderSmoothLambda));
+
+    // Stage 2 anisotropy: the colour-field gradient points along the surface normal, which is
+    // the least-variance (thin) axis Yu-Turk's PCA would find for a surface particle. Store the
+    // unit axis + its magnitude (near 0 in the interior, large at the surface) as a flatten
+    // confidence; the splat squashes each particle into a disc along this axis.
+    float nlen = length(nrm);
+    float3 axis = (nlen > 1e-5) ? (nrm / nlen) : float3(0, 1, 0);
+    _renderAniso[id.x] = float4(axis, nlen);
 }
 
 [numthreads(256,1,1)]

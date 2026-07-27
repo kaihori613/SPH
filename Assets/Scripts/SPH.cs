@@ -212,6 +212,8 @@ public class SPH : MonoBehaviour
     private ComputeBuffer _particleNormalsBuffer;
     private ComputeBuffer _renderPositions;     // Yu-Turk smoothed positions for the surface renderer
     public ComputeBuffer RenderPositions => _renderPositions;
+    private ComputeBuffer _renderAniso;         // Stage 2: per-particle flatten axis (xyz) + confidence (w)
+    public ComputeBuffer RenderAniso => _renderAniso;
     private ComputeBuffer _xsphDelta;
     private ComputeBuffer _vorticity;
     private ComputeBuffer _sortKeys;
@@ -684,6 +686,10 @@ public class SPH : MonoBehaviour
         // them at the origin, matching the master buffer's padded behaviour before this change.
         _renderPositions = new ComputeBuffer(paddedParticles, sizeof(float) * 3);
         _renderPositions.SetData(new Vector3[paddedParticles]);
+        // Stage 2 anisotropy descriptor (xyz axis, w confidence). w=0 -> splat stays spherical,
+        // so the zero-init default is a safe "no flattening" for padded/unwritten slots.
+        _renderAniso = new ComputeBuffer(paddedParticles, sizeof(float) * 4);
+        _renderAniso.SetData(new Vector4[paddedParticles]);
         _xsphDelta = new ComputeBuffer(paddedParticles, sizeof(float) * 3);
         _vorticity = new ComputeBuffer(paddedParticles, sizeof(float) * 3);
         _predPos = new ComputeBuffer(paddedParticles, sizeof(float) * 3);
@@ -782,6 +788,7 @@ public class SPH : MonoBehaviour
         SetBufferOnKernels(computeNormalsKernel);
         SetBufferOnKernels(computeRenderPositionsKernel);
         shader.SetBuffer(computeRenderPositionsKernel, "_renderPositions", _renderPositions);
+        shader.SetBuffer(computeRenderPositionsKernel, "_renderAniso", _renderAniso);
         SetBufferOnKernels(computeXsphKernel);
         SetBufferOnKernels(applyXsphKernel);
         SetBufferOnKernels(computeVorticityKernel);
@@ -1244,6 +1251,7 @@ public class SPH : MonoBehaviour
         _particleIndices?.Release();
         _particleNormalsBuffer?.Release();
         _renderPositions?.Release();
+        _renderAniso?.Release();
         _xsphDelta?.Release();
         _vorticity?.Release();
         _sortKeys?.Release();
