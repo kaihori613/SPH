@@ -16,6 +16,7 @@ Shader "Fluid/Composite"
         _SkyHorizon("Env: horizon color", Color) = (0.62, 0.66, 0.70, 1)
         _SkyGround("Env: below-horizon color", Color) = (0.22, 0.20, 0.18, 1)
         _ReflIntensity("Env reflection intensity", Range(0, 3)) = 1.0
+        _WaterColor("Water body color (rgb) + strength (a)", Color) = (0.06, 0.4, 0.55, 1)
     }
 
     SubShader
@@ -50,6 +51,7 @@ Shader "Fluid/Composite"
 
             float4 _SkyZenith, _SkyHorizon, _SkyGround;
             float  _ReflIntensity;
+            float4 _WaterColor;   // rgb = water body colour, a = in-scattering strength
             float4x4 _CamToWorld;   // set by the renderer; view-space reflection dir -> world
 
             // Analytic environment for the Fresnel reflection term.
@@ -146,11 +148,11 @@ Shader "Fluid/Composite"
                 for (int x = -_SmoothRadius; x <= _SmoothRadius; x += stride)
                 {
                     if (x == 0 && y == 0) continue;
+                    float r2 = x * x + y * y;
+                    if (r2 > _SmoothRadius * _SmoothRadius) continue; // circular kernel: no square footprint
                     float2 o = float2(x, y) * texel;
                     float zs = tex2D(_DepthTex, uv + o).r;
                     if (zs <= -1e19) continue;            // skip background
-
-                    float r2 = x * x + y * y;
                     // Deviation from the locally-planar prediction, not the raw depth gap: a
                     // smooth ramp (grazing angle) predicts perfectly and passes; only true bumps
                     // and separate surfaces deviate, so edges are still preserved.
@@ -193,7 +195,9 @@ Shader "Fluid/Composite"
                 [loop]
                 for (int x = -_SmoothRadius; x <= _SmoothRadius; x += stride)
                 {
-                    float w = exp(-(x * x + y * y) * inv2s2);
+                    float r2 = x * x + y * y;
+                    if (r2 > _SmoothRadius * _SmoothRadius) continue; // circular kernel: no square footprint
+                    float w = exp(-r2 * inv2s2);
                     acc  += tex2D(_ThicknessTex, uv + float2(x, y) * texel).r * w;
                     wsum += w;
                 }
@@ -245,7 +249,12 @@ Shader "Fluid/Composite"
                 float2 rOff = _RefractScale * clamp(rDir, -4.0, 4.0);
                 float2 rUV  = saturate(uv + rOff);
 
-                float3 refr = tex2D(_SceneTex, rUV).rgb * transmittance; // refracted color
+                // Refracted background, dimmed by Beer's-law absorption, PLUS the water's own
+                // in-scattered body colour that grows with depth (1 - transmittance). Without this
+                // term thin water just shows the grey background and reads as wet concrete; with it
+                // the water takes on _WaterColor and stands out from whatever is behind it.
+                float3 refr = tex2D(_SceneTex, rUV).rgb * transmittance;
+                refr += _WaterColor.rgb * (1.0 - transmittance) * _WaterColor.a;
 
                 // Reflected color: mirror the view vector about the surface normal and look up
                 // the environment. This is the term that gives the surface a bright sky-toned

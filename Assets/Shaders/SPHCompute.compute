@@ -49,7 +49,7 @@ RWStructuredBuffer<uint> _cellScatter;          // counting sort: running write 
 RWStructuredBuffer<uint> _cellBlockSums;        // parallel scan: per-256-block totals, then block offsets
 RWStructuredBuffer<float3> _particleNormals;
 RWStructuredBuffer<float3> _renderPositions; // Yu-Turk smoothed positions for rendering only (sorted-slot indexed)
-RWStructuredBuffer<float4> _renderAniso;     // Stage 2: xyz = surface-normal flatten axis, w = |normal| (surface confidence)
+RWStructuredBuffer<float4> _renderAniso;     // Stage 2: xyz = surface-normal flatten axis, w = neighbour count (isolation signal)
 RWStructuredBuffer<float3> _xsphDelta;
 RWStructuredBuffer<float3> _vorticity;
 
@@ -582,6 +582,7 @@ void ComputeRenderPositions(uint3 id : SV_DispatchThreadID)
     float3 wsumX = float3(0, 0, 0);
     float wsum = 0.0;
     float3 nrm = float3(0, 0, 0); // colour-field gradient -> surface normal (the flatten axis)
+    float nbrCount = 0.0;         // neighbours within h (excl. self): the isolation signal
 
     for (int i = -1; i <= 1; i++){
         for (int j = -1; j <= 1; j++){
@@ -607,8 +608,11 @@ void ComputeRenderPositions(uint3 id : SV_DispatchThreadID)
                         wsum  += w;
 
                         float dist = sqrt(r2);
-                        if (dist > 1e-6)                     // skip self; accumulate normal
+                        if (dist > 1e-6)                     // skip self; accumulate normal + count
+                        {
                             nrm += (particleMass / _sortedParticles[t].density) * gradSpiky(d, dist);
+                            nbrCount += 1.0;
+                        }
                     }
                 }
             }
@@ -624,7 +628,7 @@ void ComputeRenderPositions(uint3 id : SV_DispatchThreadID)
     // confidence; the splat squashes each particle into a disc along this axis.
     float nlen = length(nrm);
     float3 axis = (nlen > 1e-5) ? (nrm / nlen) : float3(0, 1, 0);
-    _renderAniso[id.x] = float4(axis, nlen);
+    _renderAniso[id.x] = float4(axis, nbrCount); // w = neighbour count for the splat's isolation cull
 }
 
 [numthreads(256,1,1)]

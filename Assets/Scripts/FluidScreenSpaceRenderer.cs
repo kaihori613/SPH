@@ -88,10 +88,14 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
     [Tooltip("Ellipsoid thickness along the surface normal. 1 = spheres (Stage 1 look); lower = " +
              "flatter surface-aligned discs that fuse into a smoother surface. ~0.4-0.6 is a good start.")]
     public float flattenK = 0.5f;
-    [Tooltip("Scales the stored surface-normal magnitude into a 0..1 flatten confidence. Higher = " +
-             "more particles flatten; lower = only the strongest surface particles. Interior/isolated " +
-             "particles (weak normal) stay spherical regardless.")]
-    public float anisoConfScale = 2.0f;
+    [Tooltip("Neighbour count below which a particle is treated as isolated spray and shrunk out of " +
+             "the surface (stops lone droplets rendering as dark-rimmed domes). Surface particles have " +
+             "~15-25 neighbours, spray has <8. Raise to cull more aggressively.")]
+    public float minSurfaceNbrs = 8f;
+    [Range(0f, 1f)]
+    [Tooltip("Radius multiplier for a fully-isolated particle. 0 = cull it entirely; ~0.3 = shrink to " +
+             "a small speck. Well-connected surface particles always keep full radius.")]
+    public float isolatedScale = 0.15f;
 
 
     void OnEnable()
@@ -184,7 +188,8 @@ public class FluidScreenSpaceRenderer : MonoBehaviour
         thicknessMat.SetBuffer("_renderPositions", sph.RenderPositions); // Yu-Turk smoothed centres (Stage 1)
         thicknessMat.SetBuffer("_renderAniso", sph.RenderAniso);          // Stage 2 flatten axis + confidence
         thicknessMat.SetFloat("_FlattenK", flattenK);
-        thicknessMat.SetFloat("_AnisoConfScale", anisoConfScale);
+        thicknessMat.SetFloat("_MinSurfaceNbrs", minSurfaceNbrs);
+        thicknessMat.SetFloat("_IsolatedScale", isolatedScale);
 
          // Clear thickness to 0
         Graphics.SetRenderTarget(_rtThickness);

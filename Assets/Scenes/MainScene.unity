@@ -168,7 +168,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   collisionSphere: {fileID: 1168886303}
   showSpheres: 0
-  numToSpawn: {x: 40, y: 40, z: 40}
+  numToSpawn: {x: 32, y: 32, z: 32}
   maxParticles: 131072
   boxSize: {x: 12, y: 20, z: 10}
   spawnCenter: {x: -3.9, y: 0, z: -3.9}
@@ -219,7 +219,7 @@ MonoBehaviour:
   enableBoundaryParticles: 1
   boundaryLayers: 2
   boundarySpacingScale: 1
-  enableDiffuse: 1
+  enableDiffuse: 0
   maxDiffuse: 40000
   diffuseMaterial: {fileID: 0}
   diffuseRenderSize: 2
@@ -579,7 +579,8 @@ MonoBehaviour:
   curvatureFlowMat: {fileID: 2100000, guid: 82ef2be1d19748fb8a9598e6a39de51d, type: 2}
   renderRadiusScale: 1.2
   flattenK: 0.5
-  anisoConfScale: 2
+  minSurfaceNbrs: 12
+  isolatedScale: 0.15
 --- !u!1 &989571877
 GameObject:
   m_ObjectHideFlags: 0
@@ -704,6 +705,7 @@ GameObject:
   - component: {fileID: 1168886302}
   - component: {fileID: 1168886301}
   - component: {fileID: 1168886300}
+  - component: {fileID: 1168886304}
   m_Layer: 0
   m_Name: Collision Test Sphere
   m_TagString: Untagged
@@ -804,6 +806,28 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &1168886304
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1168886299}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 9b52b922b3c444ec8b90e5165a4dd417, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::BuoyantBall
+  sph: {fileID: 553318310}
+  radius: 1.25
+  relativeDensity: 0.5
+  autoWaterLevel: 1
+  waterLevelY: 0
+  dropOnPlay: 1
+  dropFromHeight: 5
+  gravity: 9.81
+  waterDrag: 2
+  airDrag: 0.05
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

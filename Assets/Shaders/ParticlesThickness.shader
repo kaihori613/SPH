@@ -27,7 +27,8 @@ Shader "Fluid/ParticlesThickness"
     float4x4 _View;           // set by the renderer: CommandBuffer draws outside the camera loop, so UNITY_MATRIX_V is stale here
     float3 _CamRight, _CamUp; // world-space camera axes
     float _FlattenK;          // Stage 2: ellipsoid thickness along the normal (1 = sphere, <1 = flatter disc)
-    float _AnisoConfScale;    // scales the stored |normal| into a 0..1 flatten confidence
+    float _MinSurfaceNbrs;    // neighbour count below which a particle is "isolated spray" and gets shrunk
+    float _IsolatedScale;     // radius multiplier for fully-isolated particles (0 = cull, ~0.3 = shrink)
 
     struct appdata {
         float3 vertex : POSITION;   // unused
@@ -48,9 +49,15 @@ Shader "Fluid/ParticlesThickness"
         VSOut o;
 
         float2 q = v.uv * 2.0 - 1.0;
-        float r = _ParticleRadius;
+        float3 Cw = _renderPositions[inst];  // Yu-Turk smoothed centre
+        float4 aniso = _renderAniso[inst];   // xyz = flatten axis, w = neighbour count
 
-        float3 Cw = _renderPositions[inst]; // Yu-Turk smoothed centre (was _particlesBuffer[inst].position)
+        // Isolation cull: a lone droplet (few neighbours) isn't part of the water sheet, so it
+        // shouldn't render as a little dark-rimmed dome on the surface. Shrink it toward nothing
+        // as the neighbour count drops below _MinSurfaceNbrs. Well-connected particles keep full r.
+        float surf = smoothstep(_MinSurfaceNbrs, _MinSurfaceNbrs + 8.0, aniso.w);
+        float r = _ParticleRadius * lerp(_IsolatedScale, 1.0, surf);
+
         float3 Pw = Cw + r * (q.x * _CamRight + q.y * _CamUp);
 
         o.pos = mul(_VP, float4(Pw, 1));
@@ -58,11 +65,9 @@ Shader "Fluid/ParticlesThickness"
         o.centerVS = mul(_View, float4(Cw, 1)).xyz;
         o.radius = r;
 
-        // Stage 2: shrink to a disc along the surface normal, scaled by confidence.
-        float4 aniso = _renderAniso[inst];
-        float conf = saturate(aniso.w * _AnisoConfScale);
-        o.k = lerp(1.0, _FlattenK, conf);                       // 1 = sphere for low-confidence/interior
-        o.axisVS = normalize(mul((float3x3)_View, aniso.xyz));  // world axis -> view space
+        // Flatten only well-connected surface particles into surface-aligned discs (Stage 2).
+        o.k = lerp(1.0, _FlattenK, surf);
+        o.axisVS = normalize(mul((float3x3)_View, aniso.xyz)); // world axis -> view space
 
         return o;
     }
