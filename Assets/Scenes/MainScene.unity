@@ -210,10 +210,15 @@ MonoBehaviour:
   airDragCd: 0.5
   airDeform: 0.015
   airNFull: 26
-  windVelocity: {x: 2, y: 2, z: 0}
+  windVelocity: {x: 0, y: 0, z: 0}
   airDragCoeff: 1
   airDragSurfaceOnly: 1
   airDragSurfaceThreshold: 0.9
+  enableBallCoupling: 1
+  ballDragLinear: 1
+  ballDragQuad: 0.5
+  ballCouplingScale: 1
+  ballTorqueScale: 1
   enableBoundaryParticles: 1
   boundaryLayers: 2
   boundarySpacingScale: 1
@@ -751,6 +756,12 @@ MonoBehaviour:
   gravity: 9.81
   waterDrag: 2
   airDrag: 0.05
+  useFluidCoupling: 1
+  surfaceFollow: 0.15
+  angularDrag: 1.5
+  maxFluidAccel: 60
+  maxAngularAccel: 40
+  wallBounce: 0.3
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

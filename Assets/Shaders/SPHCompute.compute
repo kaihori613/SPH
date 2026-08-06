@@ -28,6 +28,7 @@
 #pragma kernel PCIComputePressureForce
 #pragma kernel DiffuseGenerate
 #pragma kernel DiffuseAdvect
+#pragma kernel BallCoupling
 
 struct Particle
 {
@@ -1423,4 +1424,71 @@ void DiffuseAdvect(uint3 id : SV_DispatchThreadID)
     d.position = clamp(d.position, -halfB + particleRadius, halfB - particleRadius);
 
     _diffuseParticles[id.x] = d;
+}
+
+// ============================ Two-way ball coupling (fluid -> rigid) ============================
+// The ball already pushes the fluid: Integrate projects particles out of the collision sphere, so
+// dropping it splashes. This kernel supplies the missing REACTION — the force and torque the fluid
+// exerts back on the ball — plus a measured local surface height.
+//
+// Why it exists: the old BuoyantBall model was gravity + Archimedes + drag, and every one of those
+// terms is a pure ±Y vector, so the ball's horizontal velocity was pinned at exactly zero forever
+// and it could only bob straight up and down against a flat analytic plane. Summing the actual
+// particle interactions gives a full 3-vector force (sideways slosh pushes the ball sideways), a
+// torque (it spins), and a surface height that undulates (it rides waves instead of a still plane).
+//
+// Accumulation is fixed-point: InterlockedAdd has no float overload. Slots:
+//   [0..2] force xyz   [3..5] torque xyz   [6] shell sample count   [7] max surface Y (quantised)
+
+RWStructuredBuffer<int> _ballAccum;
+float3 _ballVelocity;      // ball linear velocity, for relative-velocity drag
+float  _ballDragLinear;    // linear (viscous) drag gain
+float  _ballDragQuad;      // quadratic (form) drag gain
+float  _ballColumnRadius;  // XZ radius of the column sampled for the local wave height
+
+#define BALL_FP      512.0   // fixed-point scale
+#define BALL_FCLAMP 1000.0   // per-particle force clamp, keeps the int accumulators from overflowing
+
+[numthreads(256,1,1)]
+void BallCoupling (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+    Particle p = _particles[id.x];   // master buffer: post-Integrate, current state
+
+    float3 rVec = p.position - spherePosition;
+
+    // --- Local wave height: highest particle in the vertical column around the ball ---
+    // Buoyancy then follows the real surface, so the ball lifts on crests and drops into troughs.
+    float2 dXZ = rVec.xz;
+    if (dot(dXZ, dXZ) < _ballColumnRadius * _ballColumnRadius)
+        InterlockedMax(_ballAccum[7], (int)(p.position.y * BALL_FP));
+
+    // --- Contact shell: particles close enough to actually push on the ball ---
+    float dist  = length(rVec);
+    float shell = sphereRadius + h;
+    if (dist >= shell || dist < 1e-6) return;
+
+    float3 vRel = p.velocity - _ballVelocity;
+
+    // Smooth falloff so particles at the edge of the shell fade out instead of popping.
+    float t = saturate(1.0 - (dist - sphereRadius) / max(h, 1e-6));
+    float w = t * t;
+
+    // Linear + quadratic drag along the relative flow. vRel is a full 3-vector, which is what
+    // finally lets a lateral slosh move the ball laterally.
+    float3 f = (_ballDragLinear + _ballDragQuad * length(vRel)) * vRel * (particleMass * w);
+
+    // Clamp per-particle so one bad frame can't overflow the fixed-point sums.
+    float fLen = length(f);
+    if (fLen > BALL_FCLAMP) f *= BALL_FCLAMP / fLen;
+
+    float3 tq = cross(rVec, f);   // off-centre pushes spin the ball
+
+    InterlockedAdd(_ballAccum[0], (int)(f.x  * BALL_FP));
+    InterlockedAdd(_ballAccum[1], (int)(f.y  * BALL_FP));
+    InterlockedAdd(_ballAccum[2], (int)(f.z  * BALL_FP));
+    InterlockedAdd(_ballAccum[3], (int)(tq.x * BALL_FP));
+    InterlockedAdd(_ballAccum[4], (int)(tq.y * BALL_FP));
+    InterlockedAdd(_ballAccum[5], (int)(tq.z * BALL_FP));
+    InterlockedAdd(_ballAccum[6], 1);
 }

@@ -133,6 +133,20 @@ public class SPH : MonoBehaviour
     [Range(0.5f, 1.0f)]
     public float airDragSurfaceThreshold = 0.9f;
 
+    [Header("Two-way Ball Coupling")]
+    [Tooltip("Feed the fluid's force and torque back to a BuoyantBall on the collision sphere. Off = " +
+             "the old one-way model (ball splashes the fluid, but only ever bobs straight up and down).")]
+    public bool enableBallCoupling = true;
+    [Tooltip("Linear (viscous) drag gain from the fluid on the ball. Raise for a ball that gets " +
+             "carried along by the water more strongly.")]
+    public float ballDragLinear = 1.0f;
+    [Tooltip("Quadratic (form) drag gain — dominates in fast splashes, so a big wave shoves harder.")]
+    public float ballDragQuad = 0.5f;
+    [Tooltip("Overall gain on the coupling force. 0 = no fluid push, 1 = as measured.")]
+    [Range(0f, 5f)] public float ballCouplingScale = 1.0f;
+    [Tooltip("How strongly the fluid spins the ball. 0 disables rotation.")]
+    [Range(0f, 5f)] public float ballTorqueScale = 1.0f;
+
     [Header("Boundary Particles (Akinci 2012)")]
     [Tooltip("Sample the box walls with boundary particles that contribute to density and push back with pressure (fixes wall density deficiency). Off by default; toggle to A/B against the analytic clamp. Read at Awake, so change it before entering play mode.")]
     public bool enableBoundaryParticles = false;
@@ -222,6 +236,25 @@ public class SPH : MonoBehaviour
     private ComputeBuffer _cellCount;   // counting sort: particles per cell
     private ComputeBuffer _cellScatter; // counting sort: running write cursor per cell
     private ComputeBuffer _cellBlockSums; // parallel scan: per-block totals/offsets
+    // --- Two-way ball coupling (fluid -> rigid sphere) ---
+    // The GPU sums force/torque/wave-height into 8 fixed-point ints; the CPU reads them back
+    // asynchronously (a frame or two of latency is invisible on a floating object) and hands
+    // them to BuoyantBall. Async on purpose: the diagnostics path uses a blocking GetData and
+    // would stall the pipeline if it ran every step.
+    private const int BallAccumSlots = 8;
+    private const float BallFixedPoint = 512f;      // must match BALL_FP in SPHCompute.compute
+    private const int BallSurfaceSentinel = -1000000000;
+    private ComputeBuffer _ballAccumBuffer;
+    private int ballCouplingKernel = -1;
+    private readonly int[] _ballClear = new int[BallAccumSlots];
+    private bool _ballReadbackPending;
+    private Vector3 _ballForce, _ballTorque;
+    private float _ballSurfaceY;
+    private int _ballSamples;
+    private bool _ballHasData;
+    private bool _ballDestroyed;
+    private Vector3 _ballVelocityIn;
+
     private ComputeBuffer _predPos;    // PCISPH predicted position (sorted-slot)
     private ComputeBuffer _predVel;    // PCISPH predicted velocity (sorted-slot)
     private ComputeBuffer _predAccel;  // PCISPH pressure acceleration scratch (sorted-slot)
@@ -702,6 +735,7 @@ public class SPH : MonoBehaviour
 
         // 3. Kernels
         integrateKernel = shader.FindKernel("Integrate");
+        ballCouplingKernel = shader.FindKernel("BallCoupling");
         computeForceKernel = shader.FindKernel("ComputeForces");
         densityPressureKernel = shader.FindKernel("ComputeDensityPressure");
         computeNormalsKernel = shader.FindKernel("ComputeNormals");
@@ -812,6 +846,11 @@ public class SPH : MonoBehaviour
         shader.SetBuffer(integrateKernel, "_sortedParticles", _sortedParticlesBuffer);
         shader.SetBuffer(integrateKernel, "_particles", _particlesBuffer);
         shader.SetBuffer(integrateKernel, "_particleIndices", _particleIndices);
+
+        // Two-way ball coupling: reads the master buffer post-Integrate, accumulates into 8 ints.
+        _ballAccumBuffer = new ComputeBuffer(BallAccumSlots, sizeof(int));
+        shader.SetBuffer(ballCouplingKernel, "_particles", _particlesBuffer);
+        shader.SetBuffer(ballCouplingKernel, "_ballAccum", _ballAccumBuffer);
 
         // Sort + grid
         shader.SetBuffer(initSortKeysKernel, "_particles", _particlesBuffer);
@@ -1106,6 +1145,11 @@ public class SPH : MonoBehaviour
             shader.Dispatch(integrateKernel, groupsPhysics, 1, 1);
         }
 
+        // Two-way ball coupling: once per FixedUpdate, after the last substep's Integrate so the
+        // master buffer holds current positions/velocities.
+        if (enableBallCoupling && collisionSphere && ballCouplingKernel >= 0 && _ballAccumBuffer != null)
+            DispatchBallCoupling(hValue, groupsPhysics);
+
         // Yu-Turk smoothed render positions: once per FixedUpdate, reusing the last substep's
         // grid (still bound), same as the diffuse pass below. Render-only; physics untouched.
         shader.SetFloat("_renderSmoothLambda", renderPosSmoothLambda); // live-tunable
@@ -1127,6 +1171,60 @@ public class SPH : MonoBehaviour
         if (logDiagnostics && (++_logCounter % logInterval == 0))
             LogDiagnostics(hValue, mass, dtSub, nSub);
     }
+
+    // Clear the accumulators, run the sampling kernel, and kick a non-blocking readback.
+    // Only one request is in flight at a time; if the GPU is behind we simply reuse the last
+    // result rather than stalling or queueing up requests.
+    private void DispatchBallCoupling(float hValue, int groupsPhysics)
+    {
+        _ballClear[7] = BallSurfaceSentinel;   // InterlockedMax target: start below any real surface
+        _ballAccumBuffer.SetData(_ballClear);
+
+        shader.SetVector("_ballVelocity", _ballVelocityIn);
+        shader.SetFloat("_ballDragLinear", ballDragLinear);
+        shader.SetFloat("_ballDragQuad", ballDragQuad);
+        // Column for the wave-height probe: the ball's footprint plus a support radius of margin.
+        float ballR = 0.5f * Mathf.Max(Mathf.Abs(collisionSphere.lossyScale.x),
+                                       Mathf.Abs(collisionSphere.lossyScale.y),
+                                       Mathf.Abs(collisionSphere.lossyScale.z));
+        shader.SetFloat("_ballColumnRadius", ballR + hValue);
+
+        shader.Dispatch(ballCouplingKernel, groupsPhysics, 1, 1);
+
+        if (_ballReadbackPending) return;
+        _ballReadbackPending = true;
+        UnityEngine.Rendering.AsyncGPUReadback.Request(_ballAccumBuffer, req =>
+        {
+            _ballReadbackPending = false;
+            // The callback can outlive the component (domain reload, Stop). Touching the readback
+            // after OnDestroy released the buffer is a crash, so bail out.
+            if (_ballDestroyed || req.hasError) return;
+            var data = req.GetData<int>();
+            if (data.Length < BallAccumSlots) return;
+
+            _ballForce = new Vector3(data[0], data[1], data[2]) / BallFixedPoint;
+            _ballTorque = new Vector3(data[3], data[4], data[5]) / BallFixedPoint;
+            _ballSamples = data[6];
+            // Sentinel means no fluid in the ball's column (ball outside the water) — report NaN so
+            // the caller falls back to its analytic still-water level instead of teleporting.
+            _ballSurfaceY = data[7] <= BallSurfaceSentinel / 2 ? float.NaN : data[7] / BallFixedPoint;
+            _ballHasData = true;
+        });
+    }
+
+    // Latest fluid -> ball force/torque. surfaceY is the measured local wave height, or NaN when
+    // the ball isn't over any fluid. Returns false until the first readback lands.
+    public bool TryGetBallCoupling(out Vector3 force, out Vector3 torque, out float surfaceY, out int samples)
+    {
+        force = _ballForce * ballCouplingScale;
+        torque = _ballTorque * ballTorqueScale;
+        surfaceY = _ballSurfaceY;
+        samples = _ballSamples;
+        return _ballHasData && enableBallCoupling;
+    }
+
+    // BuoyantBall pushes its velocity in so the GPU can compute relative-velocity drag.
+    public void SetBallVelocity(Vector3 v) => _ballVelocityIn = v;
 
     // Synchronous readback of the master buffer -> avg density / velocity / bbox.
     // Editor-only debugging: rho ≈ restingDensity and V ≈ 0 means a settled pool;
@@ -1245,6 +1343,10 @@ public class SPH : MonoBehaviour
 
     private void OnDestroy()
     {
+        // Drain in-flight readbacks before releasing their target buffer.
+        _ballDestroyed = true;
+        UnityEngine.Rendering.AsyncGPUReadback.WaitAllRequests();
+
         _argsBuffer?.Release();
         _particlesBuffer?.Release();
         _sortedParticlesBuffer?.Release();
@@ -1270,5 +1372,6 @@ public class SPH : MonoBehaviour
         _boundaryPsi?.Release();
         _boundaryCellStarts?.Release();
         _boundaryCellEnds?.Release();
+        _ballAccumBuffer?.Release();
     }
 }

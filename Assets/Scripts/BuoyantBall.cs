@@ -47,8 +47,26 @@ public class BuoyantBall : MonoBehaviour
     [Tooltip("Linear drag in air (per second) — keep small.")]
     public float airDrag = 0.05f;
 
+    [Header("Two-way Coupling (fluid -> ball)")]
+    [Tooltip("Take force/torque from the actual fluid particles (needs Enable Ball Coupling on the SPH). " +
+             "This is what lets the ball move sideways, spin, and ride waves. Off = pure vertical bobbing.")]
+    public bool useFluidCoupling = true;
+    [Tooltip("How fast the ball follows the measured wave height. Low = smooth and laggy, " +
+             "high = jittery (the probe is a single topmost particle, so it needs some smoothing).")]
+    [Range(0.01f, 1f)] public float surfaceFollow = 0.15f;
+    [Tooltip("Angular damping (per second) so the spin settles instead of winding up forever.")]
+    public float angularDrag = 1.5f;
+    [Tooltip("Safety clamp on fluid-driven acceleration (m/s^2). Stops a bad frame launching the ball.")]
+    public float maxFluidAccel = 60f;
+    [Tooltip("Safety clamp on fluid-driven angular acceleration (rad/s^2).")]
+    public float maxAngularAccel = 40f;
+    [Tooltip("Restitution when the ball hits a box wall. 0 = stop dead, 1 = perfect bounce.")]
+    [Range(0f, 1f)] public float wallBounce = 0.3f;
+
     const float RhoWater = 1000f;
     Vector3 _vel;
+    Vector3 _angVel;          // rad/s, world axes
+    float _surfaceEMA = float.NaN;   // smoothed measured wave height under the ball
 
     void Reset()
     {
@@ -99,8 +117,29 @@ public class BuoyantBall : MonoBehaviour
         float vSphere = (4f / 3f) * Mathf.PI * r * r * r;
         float mass = relativeDensity * RhoWater * vSphere;       // ball mass from relative density
 
+        // Hand our velocity to the sim so the GPU can compute relative-velocity drag this step.
+        if (sph) sph.SetBallVelocity(_vel);
+
+        // Pull the fluid's reaction (force, torque) and the MEASURED local wave height. Without this
+        // the surface is a fixed plane and every force term is ±Y, so the ball can only bob.
+        Vector3 fFluid = Vector3.zero, tFluid = Vector3.zero;
+        bool coupled = false;
+        if (useFluidCoupling && sph &&
+            sph.TryGetBallCoupling(out fFluid, out tFluid, out float surfY, out int samples))
+        {
+            coupled = samples > 0;
+            // The probe is the single topmost particle in the ball's column, so it jitters by a
+            // particle diameter frame to frame — smooth it into a surface the ball can ride.
+            if (!float.IsNaN(surfY))
+                _surfaceEMA = float.IsNaN(_surfaceEMA) ? surfY : Mathf.Lerp(_surfaceEMA, surfY, surfaceFollow);
+        }
+
+        // Ride the real waves when we have a reading; fall back to the still-water estimate otherwise
+        // (ball in mid-air on the way down, or coupling disabled).
+        float level = (coupled && !float.IsNaN(_surfaceEMA)) ? _surfaceEMA : waterLevelY;
+
         // Submerged spherical-cap volume from how far the ball's lowest point sits below the surface.
-        float h = Mathf.Clamp(waterLevelY - (pos.y - r), 0f, 2f * r); // submersion depth [0, diameter]
+        float h = Mathf.Clamp(level - (pos.y - r), 0f, 2f * r);       // submersion depth [0, diameter]
         float vSub = Mathf.PI * h * h * (3f * r - h) / 3f;            // cap volume
         float submergedFrac = vSub / vSphere;
 
@@ -109,18 +148,44 @@ public class BuoyantBall : MonoBehaviour
         a += Vector3.up * (RhoWater * gravity * vSub) / Mathf.Max(mass, 1e-6f);
         a += -_vel * Mathf.Lerp(airDrag, waterDrag, submergedFrac);
 
+        // The fluid's own push — a full 3-vector, so a sideways slosh finally moves the ball sideways.
+        if (coupled)
+        {
+            Vector3 aFluid = fFluid / Mathf.Max(mass, 1e-6f);
+            if (aFluid.magnitude > maxFluidAccel) aFluid = aFluid.normalized * maxFluidAccel;
+            a += aFluid;
+        }
+
         _vel += a * dt;
         pos += _vel * dt;
+
+        // Rotation: torque from off-centre fluid pushes, against a solid sphere's inertia (2/5 m r^2).
+        if (coupled)
+        {
+            float inertia = 0.4f * mass * r * r;
+            Vector3 angAcc = tFluid / Mathf.Max(inertia, 1e-6f);
+            if (angAcc.magnitude > maxAngularAccel) angAcc = angAcc.normalized * maxAngularAccel;
+            _angVel += angAcc * dt;
+        }
+        _angVel *= Mathf.Exp(-angularDrag * Mathf.Lerp(0.2f, 1f, submergedFrac) * dt);
+
+        float spin = _angVel.magnitude;
+        if (spin > 1e-5f)
+            transform.rotation = Quaternion.AngleAxis(spin * Mathf.Rad2Deg * dt, _angVel / spin) * transform.rotation;
 
         // Keep the ball inside the fluid box (walls + floor) so it can't drift out or tunnel through.
         if (sph)
         {
             Vector3 half = sph.boxSize * 0.5f;
             float lo, hi;
+            // Bounce off the walls rather than dead-stopping. With lateral motion now possible, a
+            // hard zero read as the ball sticking to the glass.
             lo = -half.x + r; hi = half.x - r;
-            if (pos.x < lo) { pos.x = lo; _vel.x = 0; } else if (pos.x > hi) { pos.x = hi; _vel.x = 0; }
+            if (pos.x < lo) { pos.x = lo; _vel.x = Mathf.Abs(_vel.x) * wallBounce; }
+            else if (pos.x > hi) { pos.x = hi; _vel.x = -Mathf.Abs(_vel.x) * wallBounce; }
             lo = -half.z + r; hi = half.z - r;
-            if (pos.z < lo) { pos.z = lo; _vel.z = 0; } else if (pos.z > hi) { pos.z = hi; _vel.z = 0; }
+            if (pos.z < lo) { pos.z = lo; _vel.z = Mathf.Abs(_vel.z) * wallBounce; }
+            else if (pos.z > hi) { pos.z = hi; _vel.z = -Mathf.Abs(_vel.z) * wallBounce; }
             float floorY = -half.y + r;
             if (pos.y < floorY) { pos.y = floorY; if (_vel.y < 0) _vel.y = 0; }
         }
