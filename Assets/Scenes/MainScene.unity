@@ -212,7 +212,7 @@ MonoBehaviour:
   airDragCd: 0.5
   airDeform: 0.015
   airNFull: 26
-  windVelocity: {x: 0, y: 0, z: 0}
+  windVelocity: {x: 2, y: 2, z: 0}
   airDragCoeff: 1
   airDragSurfaceOnly: 1
   airDragSurfaceThreshold: 0.9
@@ -568,7 +568,7 @@ MonoBehaviour:
   smoothDepth: 1
   depthBlurRadius: 12
   depthBlurStride: 2
-  depthSigmaSpatial: 24
+  depthSigmaSpatial: 6
   depthSigmaRange: 10
   useCurvatureFlow: 1
   curvatureIterations: 20
@@ -580,7 +580,7 @@ MonoBehaviour:
   renderRadiusScale: 1.2
   flattenK: 0.5
   minSurfaceNbrs: 12
-  isolatedScale: 0.15
+  isolatedScale: 0
 --- !u!1 &989571877
 GameObject:
   m_ObjectHideFlags: 0
