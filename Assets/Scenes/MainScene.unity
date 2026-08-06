@@ -129,8 +129,6 @@ GameObject:
   m_Component:
   - component: {fileID: 553318309}
   - component: {fileID: 553318310}
-  - component: {fileID: 553318311}
-  - component: {fileID: 553318312}
   - component: {fileID: 553318313}
   m_Layer: 0
   m_Name: SPH Simulator
@@ -241,81 +239,6 @@ MonoBehaviour:
   substeps: 1
   logDiagnostics: 0
   logInterval: 60
---- !u!114 &553318311
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 553318307}
-  m_Enabled: 0
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 17da5ba6d3509483089a2e284a5a3c2b, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  collisionSphere: {fileID: 1168886303}
-  showSpheres: 1
-  numToSpawn: {x: 32, y: 32, z: 32}
-  boxSize: {x: 15, y: 15, z: 15}
-  spawnCenter: {x: -3.25, y: -3.25, z: -3.25}
-  particleRadius: 0.1
-  spawnJitter: 0.2
-  particleMesh: {fileID: 2540817853737639666, guid: d2bcb9b63a067d643b56910fd449b51b, type: 3}
-  particleRenderSize: 8
-  material: {fileID: 2100000, guid: ea5407f7bde59d6498a95296ae104fd0, type: 2}
-  shader: {fileID: 7200000, guid: 16f98d9e6de414247ae1c0ab1d5041ed, type: 3}
-  particles: []
-  solverIterations: 3
-  boundDamping: -0.3
-  viscosity: -0.003
-  particleMass: 1
-  restingDensity: 1
-  timeStep: 0.003
-  supportRadius: 0
-  hashTableSize: 32771
-  enableSurfaceTension: 0
-  cohesionAlpha: 1
-  curvatureGamma: 1
-  adhesionBeta: 0
-  xsphAlpha: 0.05
-  enableXSPH: 0
-  enableVorticity: 0
-  vorticityEps: 0.1
---- !u!114 &553318312
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 553318307}
-  m_Enabled: 0
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 39dae117147694598aed6f909a7a301e, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  enableDoubleDensity: 0
-  solverIterations: 2
-  stiffness: 0.004
-  nearStiffness: 0.01
-  collisionSphere: {fileID: 1168886303}
-  showSpheres: 1
-  numToSpawn: {x: 16, y: 16, z: 16}
-  boxSize: {x: 15, y: 15, z: 15}
-  spawnCenter: {x: -1, y: -1, z: -1}
-  particleRadius: 0.1
-  spawnJitter: 0.2
-  particleMesh: {fileID: 2540817853737639666, guid: d2bcb9b63a067d643b56910fd449b51b, type: 3}
-  particleRenderSize: 8
-  material: {fileID: 2100000, guid: ea5407f7bde59d6498a95296ae104fd0, type: 2}
-  shader: {fileID: 7200000, guid: ec21cf2a64e004c8daac35f269e0d483, type: 3}
-  particles: []
-  boundDamping: -0.3
-  viscosity: -0.01
-  particleMass: 1
-  gasConstant: 1.8
-  restingDensity: 1
-  timeStep: 0.002
-  hashTableSize: 8192
 --- !u!114 &553318313
 MonoBehaviour:
   m_ObjectHideFlags: 0
