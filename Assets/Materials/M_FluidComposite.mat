@@ -90,7 +90,7 @@ Material:
     - _RefractScale: 0.015
     - _SmoothRadius: 12
     - _SmoothSigmaR: 10
-    - _SmoothSigmaS: 24
+    - _SmoothSigmaS: 6
     - _SmoothStride: 2
     - _SmoothnessTextureChannel: 0
     - _SpecIntensity: 0.15
